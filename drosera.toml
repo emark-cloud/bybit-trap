@@ -5,7 +5,7 @@ drosera_address = "0x01C344b8406c3237a6b9dbd06ef2832142866d87"
 
 [traps.bybit_safe_trap]
 path = "out/BybitSafeTrap.sol/BybitSafeTrap.json"
-response_contract = "0x0000000000000000000000000000000000000000" # Set to deployed SafeGuardResponder address
+response_contract = "0x52d24A32B8d9F4B771c835e5178807d93352539D" # Set to deployed SafeGuardResponder address
 response_function = "emergencyPause(address,address,uint8)"
 cooldown_period_blocks = 20
 min_number_of_operators = 1
