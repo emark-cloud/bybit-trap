@@ -1,4 +1,4 @@
-ethereum_rpc = "https://rpc.mevblocker.io"
+ethereum_rpc = "https://eth.drpc.org"
 drosera_rpc = "https://relay.ethereum.drosera.io/"
 eth_chain_id = 1
 drosera_address = "0x01C344b8406c3237a6b9dbd06ef2832142866d87"
