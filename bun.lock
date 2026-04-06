@@ -1,0 +1,20 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bybit-safe-trap",
+      "dependencies": {
+        "drosera-contracts": "https://github.com/drosera-network/contracts",
+      },
+      "devDependencies": {
+        "forge-std": "github:foundry-rs/forge-std#v1.8.1",
+      },
+    },
+  },
+  "packages": {
+    "drosera-contracts": ["@drosera/contracts@github:drosera-network/contracts#3726d82", {}, "drosera-network-contracts-3726d82", "sha512-V3tBMnzbj/XMc8H761gKXYjXZQ4wkNMl5yKOlAuflM4UvbNCnvYoa3JS86p7KoZR0qWWHNw1cDVDigI1hm8vgg=="],
+
+    "forge-std": ["forge-std@github:foundry-rs/forge-std#bb4ceea", {}, "foundry-rs-forge-std-bb4ceea", "sha512-aKBBHb7DKLzjd6hoKHRyoWIm6jgLFdM4KUVwrX6Get107flN6Oqg/R36lJLbQ8Vu0hXcD8VmauJlVq2WSfn+FQ=="],
+  }
+}
