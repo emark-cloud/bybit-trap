@@ -13,3 +13,4 @@ max_number_of_operators = 5
 block_sample_size = 10
 private_trap = true
 whitelist = ["0x8944e2090Ccbce53dEc8F503126ca04A43D8CDE2"]
+address = "0xd4d76375E7F9b38326f895a4620157b365ba426B"
