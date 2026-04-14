@@ -5,12 +5,12 @@ drosera_address = "0x01C344b8406c3237a6b9dbd06ef2832142866d87"
 
 [traps.bybit_safe_trap]
 path = "out/BybitSafeTrap.sol/BybitSafeTrap.json"
-response_contract = "0x52d24A32B8d9F4B771c835e5178807d93352539D" # Set to deployed SafeGuardResponder address
-response_function = "emergencyPause(address,address,uint8)"
+response_contract = "0x52d24A32B8d9F4B771c835e5178807d93352539D"
+response_function = "handleIncident(uint8,bytes)"
 cooldown_period_blocks = 20
 min_number_of_operators = 1
 max_number_of_operators = 5
 block_sample_size = 10
 private_trap = true
-whitelist = ["0x8944e2090Ccbce53dEc8F503126ca04A43D8CDE2"]
+whitelist = ["0x8944e2090Ccbce53dEc8F503126ca04A43D8CDE2","0x2a3080AA52DE07702dd30b81cC97C3527e605B6A"]
 address = "0xd4d76375E7F9b38326f895a4620157b365ba426B"

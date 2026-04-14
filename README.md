@@ -1,6 +1,8 @@
 # Bybit Safe{Wallet} Exploit Trap
 
-**Drosera POC Trap — Bybit $1.46B Hack (February 21, 2025)**
+**Drosera Monitoring Tech Demo — Bybit $1.46B Hack (February 21, 2025)**
+
+A working monitoring-and-alert trap that demonstrates how Drosera could have detected the Bybit Safe{Wallet} compromise across 8 independent detection vectors, paired with a mock emergency responder.
 
 ## The Attack
 
@@ -32,13 +34,13 @@ On February 21, 2025, the Bybit exchange suffered the largest cryptocurrency the
 | Storage Manipulator | `0x96221423681A6d52E184D440a8eFCEbB105C7242` |
 | Exploit TX | `0x46deef0f52e3a983b67abf4714448a41dd7ffd6d32d32da69d62081c68ad7882` |
 
-## How Drosera Would Have Prevented It
+## How Drosera Would Have Detected It
 
 This trap monitors Safe{Wallet} multisigs across **8 detection vectors**, covering the Bybit-specific attack and generalized multisig compromise patterns.
 
 ### The 18-Block Window
 
-The masterCopy swap and the fund drain happened in **separate blocks**. Drosera operators monitoring every block would have detected the implementation swap at block 21,895,238 and triggered an emergency response **18 blocks before** the $1.46B drain at block 21,895,256. This is more than enough time for a Drosera consensus (2/3 operator agreement via BLS signatures) to form and execute a response.
+The masterCopy swap and the fund drain happened in **separate blocks**. Drosera operators monitoring every block would have detected the implementation swap at block 21,895,238 — **18 blocks before** the $1.46B drain at block 21,895,256. This is sufficient time for a Drosera consensus (2/3 operator agreement via BLS signatures) to form and submit a response transaction.
 
 ### Detection Vectors
 
@@ -46,12 +48,16 @@ The masterCopy swap and the fund drain happened in **separate blocks**. Drosera 
 |---|--------|----------|-------------|
 | 1 | Implementation compromise | CRITICAL | Calls Safe-specific functions (`getThreshold()`, `getOwners()`, `nonce()`). If the masterCopy was swapped to a contract that doesn't implement them, all calls revert — a definitive compromise signal. This is exactly what happened in the Bybit hack. |
 | 2 | Subtle masterCopy swap | CRITICAL | Reads storage slot 0 directly via `getStorageAt()` and compares against the known-good singleton address. Catches sophisticated attacks where the new implementation still implements Safe functions but contains backdoor logic. |
-| 3 | Module additions | CRITICAL | Monitors `getModulesPaginated()` for unauthorized module installations. A malicious module can bypass multisig requirements entirely, executing transactions without owner signatures. |
+| 3 | Module additions | CRITICAL | Monitors `getModulesPaginated()` (all pages) for unauthorized module installations. A malicious module can bypass multisig requirements entirely, executing transactions without owner signatures. |
 | 4 | Guard removal/change | CRITICAL | Reads the guard manager storage slot (`keccak256("guard_manager.guard.address")`). Transaction guards enforce invariants on every Safe transaction — removing or replacing one can disable critical safety checks. |
 | 5 | Threshold/owner manipulation | CRITICAL | Hashes the full owner array (`keccak256(abi.encode(getOwners()))`) and tracks the signing threshold. Detects any signer set change — additions, removals, or replacements — even when the owner count stays the same. |
-| 6 | Catastrophic balance drain | CRITICAL | Fires if the combined value of ETH + stETH + mETH + cmETH drops by more than **5%** between consecutive blocks. |
+| 6 | Catastrophic balance drain | CRITICAL | Fires if the aggregate balance drops by more than **5%** between consecutive blocks. |
 | 7 | Gradual drain | WARNING | Compares the newest snapshot against the oldest in the data window. Fires if the cumulative drop exceeds **15%** — catching slow bleeds that stay under the single-block threshold. |
 | 8 | Nonce jump | WARNING | Detects a nonce increment greater than **5** between consecutive blocks, indicating rapid batch transaction execution that could signal an automated exploit. |
+
+### Response Payload
+
+All vectors return a standardized payload: `abi.encode(uint8 threatType, bytes details)`, matching the responder's `handleIncident(uint8,bytes)` interface. This ensures the callback path is correctly wired end-to-end.
 
 ### What's Collected Each Block
 
@@ -64,14 +70,14 @@ threshold            — signing threshold
 ownerCount           — number of owners
 ownersHash           — keccak256 of the full owner array
 nonce                — Safe transaction nonce
-moduleCount          — number of enabled modules
-modulesHash          — keccak256 of the module array
+moduleCount          — number of enabled modules (all pages)
+modulesHash          — incremental keccak256 across all module pages
 guard                — transaction guard address
 ethBalance           — ETH held
 stethBalance         — stETH held
 methBalance          — mETH held
 cmethBalance         — cmETH held
-totalValue           — sum of all balances
+aggregateBalance     — raw sum of all balances (~1:1 ETH parity assumption)
 ```
 
 ## Running the Tests
@@ -87,22 +93,23 @@ forge build
 forge test --contracts test/BybitSafeTrap.t.sol -vv
 ```
 
-### Test Results (12/12 passing)
+### Test Results (13/13 passing)
 
 | Test | What it verifies |
 |------|-----------------|
 | `test_PreExploitState` | Pre-exploit state is normal — implementation valid, balances intact, correct masterCopy |
 | `test_PostSwapState` | Post-swap state — Safe functions revert, implementation flagged invalid |
-| `test_DetectsImplementationSwap` | `shouldRespond()` fires on the implementation swap (Vector 1) |
-| `test_DetectsBalanceDrain` | Balance drain detected as secondary signal (Vector 6) |
+| `test_DetectsImplementationSwap` | `shouldRespond()` fires with threat type 1 on implementation swap |
+| `test_DetectsBalanceDrain` | Balance drain detected as secondary signal (threat type 6) |
 | `test_NoFalsePositive` | No false positives during normal operation across consecutive blocks |
 | `test_FullOperatorFlow` | Full operator simulation with 5 block samples detects the exploit |
-| `test_DetectsSubtleMasterCopySwap` | Detects slot 0 change when Safe functions still work (Vector 2) |
-| `test_DetectsModuleAddition` | Detects unauthorized module installation (Vector 3) |
-| `test_DetectsGuardRemoval` | Detects transaction guard removal (Vector 4) |
-| `test_DetectsOwnerSetChange` | Detects signer set change with same owner count (Vector 5) |
-| `test_DetectsGradualDrain` | Detects cumulative >15% drain across 10-block window (Vector 7) |
-| `test_DetectsNonceJump` | Detects rapid nonce increment >5 between blocks (Vector 8) |
+| `test_DetectsSubtleMasterCopySwap` | Detects slot 0 change when Safe functions still work (threat type 2) |
+| `test_DetectsModuleAddition` | Detects unauthorized module installation (threat type 3) |
+| `test_DetectsGuardRemoval` | Detects transaction guard removal (threat type 4) |
+| `test_DetectsOwnerSetChange` | Detects signer set change with same owner count (threat type 5) |
+| `test_DetectsGradualDrain` | Detects cumulative >15% drain across 10-block window (threat type 7) |
+| `test_DetectsNonceJump` | Detects rapid nonce increment >5 between blocks (threat type 8) |
+| `test_ResponderIntegration` | End-to-end: responder receives incident, pauses, rejects unauthorized callers, admin unpauses |
 
 Tests fork Ethereum mainnet at the actual exploit blocks (21,895,237 — 21,895,256) and verify detection against real on-chain state.
 
@@ -111,9 +118,9 @@ Tests fork Ethereum mainnet at the actual exploit blocks (21,895,237 — 21,895,
 ```
 src/
   BybitSafeTrap.sol       # The Drosera trap contract (8 detection vectors)
-  SafeGuardResponder.sol  # Emergency response contract with threat type classification
+  SafeGuardResponder.sol  # Mock emergency responder with allowlist auth
 test/
-  BybitSafeTrap.t.sol     # Foundry tests against real exploit blocks (12 tests)
+  BybitSafeTrap.t.sol     # Foundry tests against real exploit blocks (13 tests)
 drosera.toml              # Drosera deployment config (block_sample_size = 10)
 foundry.toml              # Foundry config with archive RPC
 ```
@@ -126,7 +133,7 @@ The `drosera.toml` configures the trap for deployment:
 [traps.bybit_safe_trap]
 path = "out/BybitSafeTrap.sol/BybitSafeTrap.json"
 response_contract = "0x..."              # Deployed SafeGuardResponder address
-response_function = "emergencyPause(address,address,uint8)"
+response_function = "handleIncident(uint8,bytes)"
 block_sample_size = 10                   # 10-block window for gradual drain detection
 cooldown_period_blocks = 20
 min_number_of_operators = 1
@@ -134,7 +141,18 @@ max_number_of_operators = 5
 private_trap = true                      # Bytecode stays off-chain (hidden security intent)
 ```
 
-The `SafeGuardResponder` classifies incidents by threat type (1–8), allowing downstream systems to triage responses appropriately.
+The `SafeGuardResponder` uses an allowlist auth model — the admin configures which addresses can call `handleIncident()`. In Drosera, the actual `msg.sender` may be an operator EOA, relayer, or protocol executor.
+
+## Limitations
+
+This is a **monitoring-and-alert tech demo**, not a fully wired prevention system. For a complete prevention layer, you would additionally need:
+
+- **Real on-chain authority**: The mock responder pauses a flag but has no actual control over the Safe wallet or dependent protocols. A production responder would need to call `pause()` on downstream contracts, revoke approvals via a guardian, or freeze timelock queues.
+- **Correct executor wiring**: The allowlist must be populated with the actual addresses that submit response transactions in your Drosera deployment.
+- **Aggregate balance is approximate**: `aggregateBalance` sums ETH + stETH + mETH + cmETH at face value, assuming ~1:1 ETH parity. This is not a true market valuation — depegs or rebasing could cause false positives or missed triggers.
+- **Single-trigger reporting**: `shouldRespond()` short-circuits on the first detected anomaly. If multiple vectors fire simultaneously, only the highest-priority one is reported. A bitmask approach would improve incident richness.
+- **Implementation validity noise**: If Safe function calls revert for reasons unrelated to compromise (e.g., RPC issues, unusual proxy configurations), the trap will fire. Cross-confirmation with the masterCopy slot check would reduce false positives.
+- **Module pagination bounds**: Module enumeration iterates up to 100 modules (10 pages x 10 per page). Safes with more than 100 modules (extremely unlikely) would have partial coverage.
 
 ## References
 

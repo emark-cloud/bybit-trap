@@ -51,6 +51,9 @@ interface ISafe {
  *   8. Nonce jump — Detects >5 nonce increment between blocks, indicating
  *      rapid transaction execution (potential batch exploit).
  *
+ *   Response payload: all vectors return abi.encode(uint8 threatType, bytes details)
+ *   matching the responder's handleIncident(uint8,bytes) interface.
+ *
  * Fork reference blocks:
  *   - Block 21,895,237 — pre-exploit (balances intact, implementation valid)
  *   - Block 21,895,238 — masterCopy swapped to malicious implementation
@@ -64,6 +67,17 @@ interface ISafe {
  *   - Storage manipulator:      0x96221423681A6d52E184D440a8eFCEbB105C7242
  */
 contract BybitSafeTrap is ITrap {
+    // ======================== Threat Type Constants ========================
+
+    uint8 constant THREAT_IMPLEMENTATION_COMPROMISED = 1;
+    uint8 constant THREAT_MASTERCOPY_CHANGED = 2;
+    uint8 constant THREAT_MODULES_CHANGED = 3;
+    uint8 constant THREAT_GUARD_CHANGED = 4;
+    uint8 constant THREAT_CONFIG_CHANGED = 5;
+    uint8 constant THREAT_BALANCE_DRAIN = 6;
+    uint8 constant THREAT_GRADUAL_DRAIN = 7;
+    uint8 constant THREAT_NONCE_JUMP = 8;
+
     // ======================== Constants ========================
 
     /// @notice The Bybit cold wallet (Safe proxy)
@@ -93,6 +107,12 @@ contract BybitSafeTrap is ITrap {
     /// @notice Safe guard manager storage slot: keccak256("guard_manager.guard.address")
     uint256 constant GUARD_STORAGE_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
 
+    /// @notice Module pagination: max pages to iterate (prevents infinite loops)
+    uint256 constant MAX_MODULE_PAGES = 10;
+
+    /// @notice Module pagination: modules per page
+    uint256 constant MODULES_PER_PAGE = 10;
+
     // ======================== Snapshot Struct ========================
 
     struct Snapshot {
@@ -106,14 +126,14 @@ contract BybitSafeTrap is ITrap {
         uint256 nonce;             // Safe transaction nonce
         // Modules & guard
         uint256 moduleCount;       // Number of enabled modules
-        bytes32 modulesHash;       // keccak256(abi.encode(modules))
+        bytes32 modulesHash;       // keccak256(abi.encode(modules)) — incremental across pages
         address guard;             // Transaction guard address
         // Balances
         uint256 ethBalance;
         uint256 stethBalance;
         uint256 methBalance;
         uint256 cmethBalance;
-        uint256 totalValue;        // sum of all balances
+        uint256 aggregateBalance;  // raw sum of all balances (assumes ~1:1 ETH parity, not a true market value)
     }
 
     // ======================== collect() ========================
@@ -131,7 +151,7 @@ contract BybitSafeTrap is ITrap {
         // Read masterCopy from slot 0 via getStorageAt
         address masterCopy = _readMasterCopy(BYBIT_COLD_WALLET);
 
-        // Read modules
+        // Read modules (paginated — enumerates all pages)
         (uint256 moduleCount, bytes32 modulesHash) = _readModules(BYBIT_COLD_WALLET);
 
         // Read guard
@@ -159,12 +179,14 @@ contract BybitSafeTrap is ITrap {
             stethBalance: stethBal,
             methBalance: methBal,
             cmethBalance: cmethBal,
-            totalValue: total
+            aggregateBalance: total
         }));
     }
 
     // ======================== shouldRespond() ========================
 
+    /// @notice All return payloads are abi.encode(uint8 threatType, bytes details)
+    ///         to match the responder's handleIncident(uint8,bytes) interface.
     function shouldRespond(
         bytes[] calldata data
     ) external pure returns (bool, bytes memory) {
@@ -177,18 +199,16 @@ contract BybitSafeTrap is ITrap {
         // ---- Vector 1: Implementation integrity (functions revert) ----
         if (!current.implementationValid) {
             return (true, abi.encode(
-                "CRITICAL: Safe implementation compromised",
-                current.threshold,
-                current.ownerCount
+                THREAT_IMPLEMENTATION_COMPROMISED,
+                abi.encode(current.threshold, current.ownerCount)
             ));
         }
 
         // ---- Vector 2: Subtle masterCopy swap (functions still work) ----
         if (current.masterCopy != address(0) && current.masterCopy != EXPECTED_MASTER_COPY) {
             return (true, abi.encode(
-                "CRITICAL: masterCopy changed",
-                EXPECTED_MASTER_COPY,
-                current.masterCopy
+                THREAT_MASTERCOPY_CHANGED,
+                abi.encode(EXPECTED_MASTER_COPY, current.masterCopy)
             ));
         }
 
@@ -197,9 +217,8 @@ contract BybitSafeTrap is ITrap {
             if (current.moduleCount != previous.moduleCount
                 || current.modulesHash != previous.modulesHash) {
                 return (true, abi.encode(
-                    "CRITICAL: modules changed",
-                    previous.moduleCount,
-                    current.moduleCount
+                    THREAT_MODULES_CHANGED,
+                    abi.encode(previous.moduleCount, current.moduleCount)
                 ));
             }
         }
@@ -208,9 +227,8 @@ contract BybitSafeTrap is ITrap {
         if (previous.implementationValid && current.implementationValid) {
             if (current.guard != previous.guard) {
                 return (true, abi.encode(
-                    "CRITICAL: guard changed",
-                    previous.guard,
-                    current.guard
+                    THREAT_GUARD_CHANGED,
+                    abi.encode(previous.guard, current.guard)
                 ));
             }
         }
@@ -221,46 +239,43 @@ contract BybitSafeTrap is ITrap {
                 || current.ownerCount != previous.ownerCount
                 || current.ownersHash != previous.ownersHash) {
                 return (true, abi.encode(
-                    "CRITICAL: Safe config changed",
-                    previous.threshold,
-                    current.threshold,
-                    previous.ownerCount,
-                    current.ownerCount
+                    THREAT_CONFIG_CHANGED,
+                    abi.encode(
+                        previous.threshold,
+                        current.threshold,
+                        previous.ownerCount,
+                        current.ownerCount
+                    )
                 ));
             }
         }
 
         // ---- Vector 6: Catastrophic balance drain (>5% single block) ----
-        if (previous.totalValue > 0 && current.totalValue < previous.totalValue) {
-            uint256 drop = previous.totalValue - current.totalValue;
-            uint256 dropBps = (drop * 10000) / previous.totalValue;
+        if (previous.aggregateBalance > 0 && current.aggregateBalance < previous.aggregateBalance) {
+            uint256 drop = previous.aggregateBalance - current.aggregateBalance;
+            uint256 dropBps = (drop * 10000) / previous.aggregateBalance;
 
             if (dropBps >= DROP_THRESHOLD_BPS) {
                 return (true, abi.encode(
-                    "CRITICAL: balance drain detected",
-                    previous.totalValue,
-                    current.totalValue,
-                    dropBps
+                    THREAT_BALANCE_DRAIN,
+                    abi.encode(previous.aggregateBalance, current.aggregateBalance, dropBps)
                 ));
             }
         }
 
         // ---- Vector 7: Gradual drain (>15% across full window) ----
         if (data.length > 2) {
-            // data[data.length-1] is the oldest snapshot
             bytes memory oldestData = data[data.length - 1];
             if (oldestData.length > 0) {
                 Snapshot memory oldest = abi.decode(oldestData, (Snapshot));
-                if (oldest.totalValue > 0 && current.totalValue < oldest.totalValue) {
-                    uint256 cumulativeDrop = oldest.totalValue - current.totalValue;
-                    uint256 cumulativeDropBps = (cumulativeDrop * 10000) / oldest.totalValue;
+                if (oldest.aggregateBalance > 0 && current.aggregateBalance < oldest.aggregateBalance) {
+                    uint256 cumulativeDrop = oldest.aggregateBalance - current.aggregateBalance;
+                    uint256 cumulativeDropBps = (cumulativeDrop * 10000) / oldest.aggregateBalance;
 
                     if (cumulativeDropBps >= GRADUAL_DRAIN_THRESHOLD_BPS) {
                         return (true, abi.encode(
-                            "WARNING: gradual drain detected",
-                            oldest.totalValue,
-                            current.totalValue,
-                            cumulativeDropBps
+                            THREAT_GRADUAL_DRAIN,
+                            abi.encode(oldest.aggregateBalance, current.aggregateBalance, cumulativeDropBps)
                         ));
                     }
                 }
@@ -272,9 +287,8 @@ contract BybitSafeTrap is ITrap {
             if (current.nonce > previous.nonce
                 && (current.nonce - previous.nonce) > MAX_NONCE_JUMP) {
                 return (true, abi.encode(
-                    "WARNING: nonce jump detected",
-                    previous.nonce,
-                    current.nonce
+                    THREAT_NONCE_JUMP,
+                    abi.encode(previous.nonce, current.nonce)
                 ));
             }
         }
@@ -339,15 +353,33 @@ contract BybitSafeTrap is ITrap {
         return address(0);
     }
 
-    /// @dev Read enabled modules via getModulesPaginated.
-    ///      Returns (count, hash) or (0, 0) on failure.
+    /// @dev Read all enabled modules by paginating through the linked list.
+    ///      Uses incremental hashing to avoid dynamic array expansion.
+    ///      Returns (totalCount, compositeHash) or (0, 0) on failure.
     function _readModules(address safe) internal view returns (uint256, bytes32) {
-        try ISafe(safe).getModulesPaginated(address(0x1), 10)
-            returns (address[] memory modules, address)
-        {
-            return (modules.length, keccak256(abi.encode(modules)));
-        } catch {}
-        return (0, bytes32(0));
+        address start = address(0x1); // Safe sentinel value
+        uint256 totalCount = 0;
+        bytes32 runningHash = bytes32(0);
+
+        for (uint256 page = 0; page < MAX_MODULE_PAGES; page++) {
+            try ISafe(safe).getModulesPaginated(start, MODULES_PER_PAGE)
+                returns (address[] memory modules, address next)
+            {
+                totalCount += modules.length;
+                // Incrementally hash each page into the running hash
+                runningHash = keccak256(abi.encode(runningHash, modules));
+
+                // next == sentinel (0x1) or zero means end of list
+                if (next == address(0x1) || next == address(0) || modules.length == 0) {
+                    break;
+                }
+                start = next;
+            } catch {
+                break;
+            }
+        }
+
+        return (totalCount, runningHash);
     }
 
     /// @dev Read the guard address from the guard manager storage slot.
