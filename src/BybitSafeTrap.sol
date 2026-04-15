@@ -23,48 +23,129 @@ interface ISafe {
 /**
  * @title BybitSafeTrap
  * @notice Drosera trap that detects Safe{Wallet} proxy compromise across
- *         multiple attack vectors — modeled on the Bybit $1.46B hack
+ *         multiple attack vectors -- modeled on the Bybit $1.46B hack
  *         (February 21, 2025) and generalized for broader multisig protection.
  *
- * @dev Detection vectors:
+ * ============================================================================
+ *  THREAT MODEL
+ * ============================================================================
  *
- *   1. Implementation compromise — Safe-specific functions revert after
- *      masterCopy swap to a contract that doesn't implement them.
+ *  Target:  Safe{Wallet} multisig proxy contracts holding protocol treasuries.
+ *  Attack:  Proxy implementation (masterCopy) swap via delegatecall, enabling
+ *           the attacker to call backdoor drain functions on the wallet.
+ *  Scope:   Detects implementation compromise, configuration tampering, and
+ *           balance anomalies across 8 independent vectors.
  *
- *   2. Subtle masterCopy swap — Reads slot 0 directly via getStorageAt()
- *      to detect swaps where the new implementation still has Safe functions.
+ * ============================================================================
+ *  THE BYBIT EXPLOIT (February 21, 2025) -- Step-by-Step
+ * ============================================================================
  *
- *   3. Module additions — Monitors getModulesPaginated() for unauthorized
- *      module installations that could bypass multisig requirements.
+ *  1. SETUP: Attacker compromised a Safe{Wallet} developer's machine (Feb 4).
+ *     Deployed two malicious contracts on Ethereum (Feb 18):
+ *       - 0xbDd077f651EBe7f7b3cE16fe5F2b025BE2969516 (malicious implementation)
+ *       - 0x96221423681A6d52E184D440a8eFCEbB105C7242 (storage manipulator)
  *
- *   4. Guard removal/change — Reads the guard storage slot to detect
- *      removal or replacement of transaction guards.
+ *  2. EXPLOIT (Block 21,895,238): Injected JS in Safe's frontend showed signers
+ *     a legitimate-looking transfer. The real payload was delegatecall(operation=1)
+ *     to the storage manipulator, whose transfer(address,uint256) function wrote
+ *     arg[0] (the malicious implementation address) into STORAGE SLOT 0 --
+ *     overwriting the Safe proxy's masterCopy pointer.
  *
- *   5. Threshold/owner manipulation — Hashes the full owner array and
- *      tracks threshold to detect any signer set changes.
+ *  3. DRAIN (Block 21,895,256): With masterCopy now pointing to attacker code,
+ *     the attacker called backdoor functions to sweep all funds:
+ *       - 401,346 ETH + 90,375 stETH + 8,000 mETH + 15,000 cmETH = $1.46B
  *
- *   6. Catastrophic balance drain (>5%) — Single-block drop threshold.
+ *  RESPONSE WINDOW: 18 blocks between the masterCopy swap and the drain.
+ *  Drosera operators monitoring every block would have detected the swap
+ *  instantly and triggered emergency response before any funds left.
  *
- *   7. Gradual drain (>15%) — Compares newest vs oldest snapshot across
- *      the full data[] window to catch slow bleeds.
+ * ============================================================================
+ *  DETECTION VECTORS -- EXPLOIT-TO-DETECTION MAPPING
+ * ============================================================================
  *
- *   8. Nonce jump — Detects >5 nonce increment between blocks, indicating
- *      rapid transaction execution (potential batch exploit).
+ *  Vector 1: Implementation Compromise [CRITICAL]
+ *    EXPLOIT:    delegatecall overwrites slot 0 with malicious impl address.
+ *                The new contract does NOT implement Safe functions.
+ *    DETECTION:  collect() calls getThreshold(), getOwners(), nonce() via
+ *                try/catch. Post-swap, all revert -> implementationValid = false.
+ *    SIGNAL:     shouldRespond() checks !current.implementationValid -> trigger.
+ *    THIS IS THE PRIMARY DETECTION for the Bybit hack.
  *
- *   Response payload: all vectors return abi.encode(uint8 threatType, bytes details)
- *   matching the responder's handleIncident(uint8,bytes) interface.
+ *  Vector 2: Subtle MasterCopy Swap [CRITICAL]
+ *    EXPLOIT:    Attacker could use a malicious impl that still implements Safe
+ *                functions but adds backdoor logic (not the Bybit case, but a
+ *                generalized threat).
+ *    DETECTION:  collect() reads slot 0 directly via getStorageAt(0,1) and
+ *                compares against the known-good EXPECTED_MASTER_COPY address.
+ *    SIGNAL:     shouldRespond() checks masterCopy != EXPECTED_MASTER_COPY -> trigger.
  *
- * Fork reference blocks:
- *   - Block 21,895,237 — pre-exploit (balances intact, implementation valid)
- *   - Block 21,895,238 — masterCopy swapped to malicious implementation
- *   - Block 21,895,256 — ETH drained (18-block window for Drosera response)
- *   - Exploit TX: 0x46deef0f52e3a983b67abf4714448a41dd7ffd6d32d32da69d62081c68ad7882
+ *  Vector 3: Module Additions [CRITICAL]
+ *    EXPLOIT:    A malicious module can bypass multisig requirements, executing
+ *                transactions without owner signatures.
+ *    DETECTION:  collect() enumerates all module pages via getModulesPaginated()
+ *                with incremental hashing. Change in count or hash -> anomaly.
+ *    SIGNAL:     shouldRespond() compares moduleCount and modulesHash between
+ *                current and previous snapshots -> trigger on any change.
  *
- * Key addresses:
- *   - Victim wallet:            0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4
- *   - Attacker EOA:             0x0fa09c3a328792253f8dee7116848723b72a6d2e
- *   - Malicious implementation: 0xbDd077f651EBe7f7b3cE16fe5F2b025BE2969516
- *   - Storage manipulator:      0x96221423681A6d52E184D440a8eFCEbB105C7242
+ *  Vector 4: Guard Removal/Change [CRITICAL]
+ *    EXPLOIT:    Removing a transaction guard disables invariant checks on every
+ *                Safe transaction (e.g., spending limits, recipient whitelists).
+ *    DETECTION:  collect() reads the guard_manager.guard.address storage slot.
+ *    SIGNAL:     shouldRespond() compares current.guard vs previous.guard -> trigger.
+ *
+ *  Vector 5: Threshold/Owner Manipulation [CRITICAL]
+ *    EXPLOIT:    Lowering threshold or swapping signers allows the attacker to
+ *                reach quorum alone (e.g., 3-of-6 -> 1-of-1).
+ *    DETECTION:  collect() hashes the full owner array via keccak256(abi.encode(
+ *                getOwners())) and records threshold + ownerCount.
+ *    SIGNAL:     shouldRespond() checks threshold, ownerCount, and ownersHash
+ *                for any change between snapshots -> trigger.
+ *
+ *  Vector 6: Catastrophic Balance Drain [CRITICAL]
+ *    EXPLOIT:    Post-compromise, attacker sweeps funds in one transaction.
+ *    DETECTION:  collect() records aggregateBalance (ETH + stETH + mETH + cmETH).
+ *    SIGNAL:     shouldRespond() computes single-block drop in bps.
+ *                Drop >= 500 bps (5%) -> trigger. This is the SECONDARY detection
+ *                for Bybit (fires 18 blocks after Vector 1).
+ *
+ *  Vector 7: Gradual Drain [WARNING]
+ *    EXPLOIT:    Attacker drains slowly (e.g., 2% per block) to stay under
+ *                the single-block threshold.
+ *    DETECTION:  collect() same as Vector 6.
+ *    SIGNAL:     shouldRespond() compares newest vs oldest snapshot across the
+ *                full data[] window. Cumulative drop >= 1500 bps (15%) -> trigger.
+ *
+ *  Vector 8: Nonce Jump [WARNING]
+ *    EXPLOIT:    Automated exploit batch-executes many transactions in rapid
+ *                succession.
+ *    DETECTION:  collect() records the Safe nonce.
+ *    SIGNAL:     shouldRespond() checks nonce increment between consecutive
+ *                snapshots. Jump > 5 -> trigger.
+ *
+ * ============================================================================
+ *  RESPONSE PATH
+ * ============================================================================
+ *
+ *  All vectors return: abi.encode(uint8 threatType, bytes details)
+ *  Matching TOML:      response_function = "handleIncident(uint8,bytes)"
+ *  Responder action:   SafeGuardResponder.handleIncident() pauses dependent
+ *                      protocol operations and logs the incident.
+ *
+ * ============================================================================
+ *  REFERENCE
+ * ============================================================================
+ *
+ *  Fork blocks:
+ *    - 21,895,237 -- pre-exploit (balances intact, implementation valid)
+ *    - 21,895,238 -- masterCopy swapped to malicious implementation
+ *    - 21,895,256 -- ETH drained (18-block window for Drosera response)
+ *    - Exploit TX: 0x46deef0f52e3a983b67abf4714448a41dd7ffd6d32d32da69d62081c68ad7882
+ *
+ *  Key addresses:
+ *    - Victim wallet:            0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4
+ *    - Attacker EOA:             0x0fa09c3a328792253f8dee7116848723b72a6d2e
+ *    - Malicious implementation: 0xbDd077f651EBe7f7b3cE16fe5F2b025BE2969516
+ *    - Storage manipulator:      0x96221423681A6d52E184D440a8eFCEbB105C7242
  */
 contract BybitSafeTrap is ITrap {
     // ======================== Threat Type Constants ========================
@@ -112,6 +193,9 @@ contract BybitSafeTrap is ITrap {
 
     /// @notice Module pagination: modules per page
     uint256 constant MODULES_PER_PAGE = 10;
+
+    /// @notice Minimum valid ABI-encoded Snapshot size (14 fields x 32 bytes)
+    uint256 constant MIN_SNAPSHOT_BYTES = 448;
 
     // ======================== Snapshot Struct ========================
 
@@ -190,13 +274,24 @@ contract BybitSafeTrap is ITrap {
     function shouldRespond(
         bytes[] calldata data
     ) external pure returns (bool, bytes memory) {
+        // Guard: need at least 2 samples to compare current vs previous
         if (data.length < 2) return (false, "");
-        if (data[0].length == 0 || data[1].length == 0) return (false, "");
+        // Guard: both samples must be valid encoded Snapshots (14 fields x 32 bytes = 448)
+        if (data[0].length < MIN_SNAPSHOT_BYTES || data[1].length < MIN_SNAPSHOT_BYTES) {
+            return (false, "");
+        }
 
         Snapshot memory current = abi.decode(data[0], (Snapshot));
         Snapshot memory previous = abi.decode(data[1], (Snapshot));
 
-        // ---- Vector 1: Implementation integrity (functions revert) ----
+        // ---- Vector 1: Implementation Compromise [PRIMARY BYBIT DETECTION] ----
+        // EXPLOIT:    delegatecall at block 21,895,238 wrote malicious address to slot 0,
+        //             replacing the Safe proxy's masterCopy. The malicious contract does NOT
+        //             implement getThreshold/getOwners/nonce, so all Safe calls revert.
+        // DETECTION:  collect() probes these functions via try/catch. Post-swap, all revert,
+        //             setting implementationValid = false in the snapshot.
+        // NEUTRALIZES: The swap is caught the instant it happens -- 18 blocks before any
+        //              funds leave the wallet. Response pauses dependent operations.
         if (!current.implementationValid) {
             return (true, abi.encode(
                 THREAT_IMPLEMENTATION_COMPROMISED,
@@ -204,7 +299,14 @@ contract BybitSafeTrap is ITrap {
             ));
         }
 
-        // ---- Vector 2: Subtle masterCopy swap (functions still work) ----
+        // ---- Vector 2: Subtle MasterCopy Swap ----
+        // EXPLOIT:    A more sophisticated attacker could swap to an implementation that
+        //             still passes Safe function probes but contains backdoor drain logic.
+        //             Vector 1 would NOT catch this -- the functions still respond normally.
+        // DETECTION:  collect() reads slot 0 directly via getStorageAt(0,1) and records
+        //             the raw masterCopy address. Any deviation from EXPECTED_MASTER_COPY
+        //             triggers regardless of whether the new impl passes function probes.
+        // NEUTRALIZES: Catches the class of attacks that Vector 1 misses.
         if (current.masterCopy != address(0) && current.masterCopy != EXPECTED_MASTER_COPY) {
             return (true, abi.encode(
                 THREAT_MASTERCOPY_CHANGED,
@@ -212,7 +314,15 @@ contract BybitSafeTrap is ITrap {
             ));
         }
 
-        // ---- Vector 3: Module additions ----
+        // ---- Vector 3: Module Additions ----
+        // EXPLOIT:    An attacker with partial Safe access could enableModule() to install
+        //             a malicious module that bypasses multisig requirements entirely --
+        //             modules can execute transactions without owner signatures.
+        // DETECTION:  collect() enumerates all module pages via getModulesPaginated() and
+        //             computes an incremental keccak256 hash. Any change in module count
+        //             or composition triggers.
+        // NEUTRALIZES: Detects unauthorized module installations before they can be used
+        //              to bypass multisig.
         if (previous.implementationValid && current.implementationValid) {
             if (current.moduleCount != previous.moduleCount
                 || current.modulesHash != previous.modulesHash) {
@@ -223,7 +333,13 @@ contract BybitSafeTrap is ITrap {
             }
         }
 
-        // ---- Vector 4: Guard removal/change ----
+        // ---- Vector 4: Guard Removal/Change ----
+        // EXPLOIT:    Removing a transaction guard disables invariant checks enforced on
+        //             every Safe transaction (e.g., spending limits, recipient whitelists).
+        //             An attacker who can removeGuard() gains unrestricted transaction ability.
+        // DETECTION:  collect() reads the guard_manager.guard.address storage slot directly.
+        //             Any change between snapshots triggers.
+        // NEUTRALIZES: Detects guard tampering before unrestricted transactions can execute.
         if (previous.implementationValid && current.implementationValid) {
             if (current.guard != previous.guard) {
                 return (true, abi.encode(
@@ -233,7 +349,15 @@ contract BybitSafeTrap is ITrap {
             }
         }
 
-        // ---- Vector 5: Threshold/owner manipulation ----
+        // ---- Vector 5: Threshold/Owner Manipulation ----
+        // EXPLOIT:    Lowering the signing threshold (e.g., 3-of-6 -> 1-of-6) or replacing
+        //             owners with attacker-controlled addresses enables the attacker to
+        //             reach quorum alone. Even swapping a single owner (same count, different
+        //             address) is a compromise signal.
+        // DETECTION:  collect() hashes the full owner array via keccak256(abi.encode(getOwners()))
+        //             and records threshold + ownerCount. Any change in any of these triggers.
+        // NEUTRALIZES: Catches signer set tampering including same-count owner replacements
+        //              that a simple count check would miss.
         if (previous.implementationValid && current.implementationValid) {
             if (current.threshold != previous.threshold
                 || current.ownerCount != previous.ownerCount
@@ -250,7 +374,15 @@ contract BybitSafeTrap is ITrap {
             }
         }
 
-        // ---- Vector 6: Catastrophic balance drain (>5% single block) ----
+        // ---- Vector 6: Catastrophic Balance Drain (>5% single block) ----
+        // EXPLOIT:    After the Bybit masterCopy swap, the attacker called backdoor functions
+        //             to sweep all funds at block 21,895,256 -- 401,346 ETH + LSTs in one TX.
+        // DETECTION:  collect() records aggregateBalance (ETH + stETH + mETH + cmETH).
+        //             shouldRespond() computes the single-block drop in basis points.
+        //             Drop >= 500 bps (5%) triggers. The Bybit drain was ~100% in one block.
+        // NEUTRALIZES: This is the SECONDARY detection for Bybit -- fires 18 blocks AFTER
+        //              Vector 1 already caught the implementation swap. Serves as a backstop
+        //              and catches balance drains that happen without implementation changes.
         if (previous.aggregateBalance > 0 && current.aggregateBalance < previous.aggregateBalance) {
             uint256 drop = previous.aggregateBalance - current.aggregateBalance;
             uint256 dropBps = (drop * 10000) / previous.aggregateBalance;
@@ -263,10 +395,17 @@ contract BybitSafeTrap is ITrap {
             }
         }
 
-        // ---- Vector 7: Gradual drain (>15% across full window) ----
+        // ---- Vector 7: Gradual Drain (>15% across full window) ----
+        // EXPLOIT:    An attacker drains small amounts each block (e.g., 2% per block) to
+        //             stay under the single-block 5% threshold from Vector 6.
+        // DETECTION:  shouldRespond() compares newest snapshot (data[0]) against oldest
+        //             (data[data.length-1]) across the full block_sample_size window.
+        //             Cumulative drop >= 1500 bps (15%) triggers.
+        // NEUTRALIZES: Catches slow-bleed attacks that Vector 6 misses. With block_sample_size=10,
+        //              a 2%/block drain triggers after 8 blocks (16% cumulative).
         if (data.length > 2) {
             bytes memory oldestData = data[data.length - 1];
-            if (oldestData.length > 0) {
+            if (oldestData.length >= MIN_SNAPSHOT_BYTES) {
                 Snapshot memory oldest = abi.decode(oldestData, (Snapshot));
                 if (oldest.aggregateBalance > 0 && current.aggregateBalance < oldest.aggregateBalance) {
                     uint256 cumulativeDrop = oldest.aggregateBalance - current.aggregateBalance;
@@ -282,7 +421,14 @@ contract BybitSafeTrap is ITrap {
             }
         }
 
-        // ---- Vector 8: Nonce jump ----
+        // ---- Vector 8: Nonce Jump ----
+        // EXPLOIT:    An automated exploit batch-executes many Safe transactions in rapid
+        //             succession (e.g., draining to multiple addresses or executing a
+        //             multi-step attack in one block).
+        // DETECTION:  collect() records the Safe nonce. shouldRespond() checks the nonce
+        //             increment between consecutive snapshots. Jump > 5 triggers.
+        // NEUTRALIZES: Flags abnormal transaction velocity that may indicate automated
+        //              exploitation, even if individual transactions look benign.
         if (previous.implementationValid && current.implementationValid) {
             if (current.nonce > previous.nonce
                 && (current.nonce - previous.nonce) > MAX_NONCE_JUMP) {
