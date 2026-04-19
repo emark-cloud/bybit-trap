@@ -2,8 +2,8 @@
 pragma solidity ^0.8.20;
 
 import {Test, console} from "forge-std/Test.sol";
-import {BybitSafeTrap, ISafe, IERC20} from "../src/BybitSafeTrap.sol";
-import {SafeGuardResponder} from "../src/SafeGuardResponder.sol";
+import {BybitSafeTrap, ISafe, IERC20} from "../../src/v1/BybitSafeTrap.sol";
+import {SafeGuardResponder} from "../../src/v1/SafeGuardResponder.sol";
 
 /// @title Bybit Safe Exploit -- Drosera Trap Test
 /// @notice Validates that the BybitSafeTrap detects implementation swaps,
