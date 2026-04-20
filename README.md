@@ -213,4 +213,3 @@ whitelist = ["0x...", "0x..."]
 - [NCC Group In-Depth Analysis](https://www.nccgroup.com/research/in-depth-technical-analysis-of-the-bybit-hack/)
 - [CSIS Analysis](https://www.csis.org/analysis/bybit-heist-and-future-us-crypto-regulation)
 - [Drosera Developer Docs](https://dev.drosera.io/)
-- Project `GUIDELINES.md` — the production-trap design rules this trap implements
