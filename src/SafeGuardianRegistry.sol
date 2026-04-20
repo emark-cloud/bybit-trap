@@ -15,7 +15,6 @@ interface IEmergencyActionTarget {
  *         emergency targets without redeploying the responder. The responder
  *         fans out each incident to every approved target.
  *
- *         See GUIDELINES.md §9 "Guardian Registry (Fan-Out Pattern)".
  */
 contract SafeGuardianRegistry {
     address public owner;
