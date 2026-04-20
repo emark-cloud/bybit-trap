@@ -519,7 +519,7 @@ contract SafeGuardResponderV2Test is Test {
 
     function _samplePayload() internal pure returns (bytes memory) {
         SafeGuardResponderV2.IncidentPayload memory p = SafeGuardResponderV2.IncidentPayload({
-            threatType: 3, // MasterCopyChanged
+            threatType: SafeGuardResponderV2.ThreatType.MasterCopyChanged,
             safeProxy: 0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4,
             currentBlockNumber: 21_895_238,
             previousBlockNumber: 21_895_237,
@@ -571,7 +571,7 @@ contract SafeGuardResponderV2Test is Test {
     function test_Idempotent_DifferentPayloadsProduceSeparateIncidents() public {
         bytes memory p1 = _samplePayload();
         SafeGuardResponderV2.IncidentPayload memory decoded = SafeGuardResponderV2.IncidentPayload({
-            threatType: 7,
+            threatType: SafeGuardResponderV2.ThreatType.BalanceDrain,
             safeProxy: 0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4,
             currentBlockNumber: 21_895_256,
             previousBlockNumber: 21_895_255,
@@ -590,7 +590,7 @@ contract SafeGuardResponderV2Test is Test {
 
     function test_Reject_InvalidThreatType() public {
         SafeGuardResponderV2.IncidentPayload memory p = SafeGuardResponderV2.IncidentPayload({
-            threatType: 0,
+            threatType: SafeGuardResponderV2.ThreatType.None,
             safeProxy: address(0x1),
             currentBlockNumber: 1,
             previousBlockNumber: 0,
@@ -603,7 +603,7 @@ contract SafeGuardResponderV2Test is Test {
 
     function test_Reject_ZeroSafeProxy() public {
         SafeGuardResponderV2.IncidentPayload memory p = SafeGuardResponderV2.IncidentPayload({
-            threatType: 3,
+            threatType: SafeGuardResponderV2.ThreatType.MasterCopyChanged,
             safeProxy: address(0),
             currentBlockNumber: 1,
             previousBlockNumber: 0,
@@ -616,7 +616,7 @@ contract SafeGuardResponderV2Test is Test {
 
     function test_Reject_BadBlockOrdering() public {
         SafeGuardResponderV2.IncidentPayload memory p = SafeGuardResponderV2.IncidentPayload({
-            threatType: 3,
+            threatType: SafeGuardResponderV2.ThreatType.MasterCopyChanged,
             safeProxy: address(0x1),
             currentBlockNumber: 10,
             previousBlockNumber: 20,

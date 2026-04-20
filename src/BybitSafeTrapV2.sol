@@ -202,7 +202,11 @@ contract BybitSafeTrapV2 is ITrap {
             }
         }
 
-        // 1. MonitoringDegraded — loss of visibility is itself actionable.
+        // EXPLOIT:   Attacker may disable or obscure Safe introspection (e.g. swap
+        //            masterCopy to a contract whose getStorageAt/getModulesPaginated
+        //            revert) to blind defenders before the drain tx.
+        // DETECTION: Any fallible read sets its xxxReadOk flag to false. Loss of
+        //            visibility is itself actionable — pause before damage.
         if (!current.masterCopyReadOk || !current.guardReadOk || !current.modulesReadComplete) {
             return _incident(
                 ThreatType.MonitoringDegraded,
@@ -216,7 +220,13 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 2. ImplementationCompromised — Bybit primary signal.
+        // EXPLOIT:   Bybit (2025-02-21, block 21,895,238) — delegatecall swapped
+        //            the Safe{Wallet} masterCopy to a malicious implementation;
+        //            afterwards getThreshold()/getOwners()/nonce() reverted or
+        //            returned garbage, immediately preceding the $1.46B drain.
+        // DETECTION: _probeSafeImplementation() sets implementationValid=false
+        //            when any of those three reads revert or when threshold is
+        //            inconsistent with ownerCount. Primary Bybit signal.
         if (!current.implementationValid) {
             return _incident(
                 ThreatType.ImplementationCompromised,
@@ -226,7 +236,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 3. MasterCopyChanged — absolute baseline integrity check.
+        // EXPLOIT:   Bybit attack wrote a new masterCopy address into Safe
+        //            storage slot 0 via a crafted delegatecall.
+        // DETECTION: _readMasterCopy reads slot 0 via getStorageAt(0,1); any
+        //            deviation from the governance-approved baseline triggers
+        //            even if the malicious impl keeps the view ABI working.
         if (current.masterCopy != EXPECTED_MASTER_COPY) {
             return _incident(
                 ThreatType.MasterCopyChanged,
@@ -236,7 +250,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 4. ConfigChanged (absolute) — threshold / owners vs known-good baseline.
+        // EXPLOIT:   Alternative vector — attacker reduces threshold, removes
+        //            owners, or swaps the owner set to keys they control,
+        //            allowing unilateral treasury moves.
+        // DETECTION: Absolute comparison against EXPECTED_THRESHOLD /
+        //            EXPECTED_OWNER_COUNT / EXPECTED_OWNERS_HASH (when set).
         if (
             current.threshold != EXPECTED_THRESHOLD ||
             current.ownerCount != EXPECTED_OWNER_COUNT ||
@@ -260,7 +278,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 5. GuardChanged (relative).
+        // EXPLOIT:   Attacker clears or replaces the Safe transaction guard
+        //            (setGuard()) to silence the defensive pre-exec hook before
+        //            draining.
+        // DETECTION: Relative check — current.guard != previous.guard flags any
+        //            block-over-block change.
         if (current.guard != previous.guard) {
             return _incident(
                 ThreatType.GuardChanged,
@@ -270,7 +292,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 6. ModulesChanged (relative) — only fires when both snapshots had complete reads.
+        // EXPLOIT:   enableModule() installs a module that can execTransactionFromModule
+        //            with no owner signatures — a classic multisig backdoor.
+        // DETECTION: Relative diff of moduleCount / modulesHash across the paginated
+        //            read. Gated on previous.modulesReadComplete so a one-block
+        //            paging failure does not produce a false positive.
         if (
             previous.modulesReadComplete && (
                 current.moduleCount != previous.moduleCount ||
@@ -285,7 +311,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 7. ConfigChanged (relative) — catches signer drift even with no absolute baseline.
+        // EXPLOIT:   Signer-set drift (addOwnerWithThreshold / swapOwner / etc.)
+        //            short of tripping the absolute baseline — e.g. deployments
+        //            where EXPECTED_OWNERS_HASH is left unset.
+        // DETECTION: Block-over-block diff of threshold / ownerCount / ownersHash
+        //            catches drift even without a governance-supplied baseline.
         if (
             current.threshold != previous.threshold ||
             current.ownerCount != previous.ownerCount ||
@@ -306,7 +336,11 @@ contract BybitSafeTrapV2 is ITrap {
             );
         }
 
-        // 8. BalanceDrain — single-block >= 5% drop.
+        // EXPLOIT:   Primary Bybit damage — ~400k ETH / stETH / mETH / cmETH
+        //            swept out of the cold wallet in a single block after the
+        //            masterCopy swap.
+        // DETECTION: Aggregate ETH + LST balance drop of >= 5% in one block.
+        //            Catches the drain tx itself, independent of masterCopy logic.
         if (previous.aggregateBalance > 0 && current.aggregateBalance < previous.aggregateBalance) {
             uint256 drop = previous.aggregateBalance - current.aggregateBalance;
             uint256 dropBps = (drop * BPS) / previous.aggregateBalance;
@@ -321,7 +355,10 @@ contract BybitSafeTrapV2 is ITrap {
             }
         }
 
-        // 9. GradualDrain — cumulative >= 15% across the full sample window.
+        // EXPLOIT:   Stealth variant — attacker paces withdrawals across multiple
+        //            blocks to stay under the single-block 5% threshold.
+        // DETECTION: Cumulative >= 15% drop between oldest and newest snapshot in
+        //            the configured window (block_sample_size).
         Snapshot memory oldest = _decodeSnapshot(data[data.length - 1]);
         if (oldest.aggregateBalance > 0 && current.aggregateBalance < oldest.aggregateBalance) {
             uint256 cumulativeDrop = oldest.aggregateBalance - current.aggregateBalance;
@@ -337,7 +374,10 @@ contract BybitSafeTrapV2 is ITrap {
             }
         }
 
-        // 10. NonceJump — abnormal tx velocity.
+        // EXPLOIT:   Post-compromise the attacker may batch multiple Safe
+        //            execTransaction calls back-to-back, advancing the nonce
+        //            faster than any legitimate operational cadence.
+        // DETECTION: nonce delta vs previous snapshot greater than MAX_NONCE_JUMP.
         if (current.nonce > previous.nonce && (current.nonce - previous.nonce) > MAX_NONCE_JUMP) {
             return _incident(
                 ThreatType.NonceJump,

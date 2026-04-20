@@ -16,8 +16,23 @@ import {SafeGuardianRegistry, IEmergencyActionTarget} from "./SafeGuardianRegist
  *  See GUIDELINES.md §9 (Response Contract Design).
  */
 contract SafeGuardResponderV2 {
+    /// @notice Mirrors BybitSafeTrapV2.ThreatType. Enum is uint8-backed, so the
+    ///         ABI shape of IncidentPayload is identical to the trap's encoding.
+    enum ThreatType {
+        None,
+        MonitoringDegraded,
+        ImplementationCompromised,
+        MasterCopyChanged,
+        ModulesChanged,
+        GuardChanged,
+        ConfigChanged,
+        BalanceDrain,
+        GradualDrain,
+        NonceJump
+    }
+
     struct IncidentPayload {
-        uint8 threatType;
+        ThreatType threatType;
         address safeProxy;
         uint256 currentBlockNumber;
         uint256 previousBlockNumber;
@@ -34,7 +49,7 @@ contract SafeGuardResponderV2 {
     mapping(address => bool) public allowedCallers;
     mapping(bytes32 => bool) public executedIncidentHash;
 
-    uint8 public lastThreatType;
+    ThreatType public lastThreatType;
     address public lastSafeProxy;
     uint256 public lastIncidentBlock;
     bytes public lastDetails;
@@ -48,7 +63,7 @@ contract SafeGuardResponderV2 {
         bytes32 indexed incidentHash,
         address indexed caller,
         address indexed safeProxy,
-        uint8 threatType,
+        ThreatType threatType,
         uint256 currentBlockNumber,
         uint256 previousBlockNumber,
         bytes details
@@ -109,7 +124,7 @@ contract SafeGuardResponderV2 {
         require(!globallyPaused, "responder paused");
 
         IncidentPayload memory payload = abi.decode(rawPayload, (IncidentPayload));
-        require(payload.threatType > 0, "invalid threat");
+        require(payload.threatType != ThreatType.None, "invalid threat");
         require(payload.safeProxy != address(0), "invalid safe");
         require(payload.currentBlockNumber >= payload.previousBlockNumber, "bad blocks");
 
