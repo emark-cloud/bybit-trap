@@ -1,10 +1,8 @@
-# Bybit Safe{Wallet} Exploit Trap — V2
+# Bybit Safe{Wallet} Exploit Trap
 
 **Operation Flytrap PoC — Bybit $1.46B Hack (February 21, 2025)**
 
-Production-grade Drosera trap demonstrating how the protocol would have detected and contained the largest cryptocurrency theft in history. The V2 release hardens the original PoC against an external review: incidents carry a structured payload, `shouldRespond()` validates strict sample ordering, every fallible read exposes a status flag, and the responder is idempotent and fans out to a governance-managed registry of emergency-action targets.
-
-> **Archived V1** (first-pass PoC, kept for reference) lives under `src/v1/` and `test/v1/`. The rest of this README documents V2 only.
+Production-grade Drosera trap demonstrating how the protocol would have detected and contained the largest cryptocurrency theft in history. Incidents carry a structured payload, `shouldRespond()` validates strict sample ordering, every fallible read exposes a status flag, and the responder is idempotent and fans out to a governance-managed registry of emergency-action targets.
 
 ## The Attack
 
@@ -47,7 +45,7 @@ On February 21, 2025, the Bybit exchange suffered the largest cryptocurrency the
 
 ## Architecture
 
-V2 is split into five contracts:
+The system is split into five contracts:
 
 ```
 src/
@@ -95,7 +93,7 @@ struct IncidentPayload {
 }
 ```
 
-Matching signature: `handleIncident(bytes)` — simpler and more extensible than V1's `handleIncident(uint8,bytes)`.
+Matching signature: `handleIncident(bytes)`.
 
 ## Detection Vectors
 
@@ -172,11 +170,11 @@ Fork tests require an Ethereum archive RPC; the default is `https://eth.drpc.org
 
 ### Fork-test caveat
 
-Foundry forks return empty bytes from Safe's `getStorageAt` — a known environmental limitation, not a trap defect. V2 correctly flags this as `MonitoringDegraded`. The fork tests normalize the read flags before exercising the `ImplementationCompromised` path so the assertion chain proves the real Bybit signal. Real operator RPCs are not affected.
+Foundry forks return empty bytes from Safe's `getStorageAt` — a known environmental limitation, not a trap defect. The trap correctly flags this as `MonitoringDegraded`. The fork tests normalize the read flags before exercising the `ImplementationCompromised` path so the assertion chain proves the real Bybit signal. Real operator RPCs are not affected.
 
 ## Configuration
 
-`drosera.toml` — V2 entry:
+`drosera.toml`:
 
 ```toml
 [traps.bybit_safe_trap_v2]
@@ -215,4 +213,4 @@ whitelist = ["0x...", "0x..."]
 - [NCC Group In-Depth Analysis](https://www.nccgroup.com/research/in-depth-technical-analysis-of-the-bybit-hack/)
 - [CSIS Analysis](https://www.csis.org/analysis/bybit-heist-and-future-us-crypto-regulation)
 - [Drosera Developer Docs](https://dev.drosera.io/)
-- Project `GUIDELINES.md` — the production-trap design rules this V2 rewrite implements
+- Project `GUIDELINES.md` — the production-trap design rules this trap implements
