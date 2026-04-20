@@ -12,8 +12,6 @@ import {SafeGuardianRegistry, IEmergencyActionTarget} from "./SafeGuardianRegist
  *  - Allowlisted callers (relayer + additional allowed addresses).
  *  - Global pause kill-switch for false-positive storms.
  *  - Fans out to every approved emergency target in SafeGuardianRegistry.
- *
- *  See GUIDELINES.md §9 (Response Contract Design).
  */
 contract SafeGuardResponderV2 {
     /// @notice Mirrors BybitSafeTrapV2.ThreatType. Enum is uint8-backed, so the
