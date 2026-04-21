@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {BybitSafeTrapV2} from "../src/BybitSafeTrapV2.sol";
+import {BaselineFeeder} from "../src/BaselineFeeder.sol";
 import {SafeGuardResponderV2} from "../src/SafeGuardResponderV2.sol";
 import {SafeGuardianRegistry} from "../src/SafeGuardianRegistry.sol";
 import {MockGuardianTarget} from "../src/mocks/MockGuardianTarget.sol";
@@ -12,14 +13,17 @@ interface ISafeV2 {
     function getOwners() external view returns (address[] memory);
 }
 
-/// @title BybitSafeTrapV2 + SafeGuardResponderV2 -- full V2 test suite
+/// @title BybitSafeTrapV2 + SafeGuardResponderV2 full test suite
 /// @notice Covers:
 ///         - Synthetic shouldRespond logic (no fork required)
+///         - BaselineFeeder-driven absolute checks + unconfigured-baseline path
+///         - Balance-read degradation feeding MonitoringDegraded
+///         - Malformed-bytes robustness (length check + failing closed)
 ///         - Sample-ordering + safeProxy-binding validation
 ///         - Every ThreatType trigger
-///         - Absolute vs relative integrity checks
 ///         - Live mainnet fork proving ImplementationCompromised fires at the real swap block
 ///         - Responder idempotency, allowlist, relayer, global pause, registry fan-out
+///         - Registry duplicate-target bug fix + MAX_TARGETS bound
 contract BybitSafeTrapV2Test is Test {
     // ======================== Constants ========================
 
@@ -28,6 +32,10 @@ contract BybitSafeTrapV2Test is Test {
 
     address constant SAFE_PROXY = 0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4;
     address constant EXPECTED_MASTER_COPY = 0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F;
+
+    address constant STETH = 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84;
+    address constant METH  = 0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa;
+    address constant CMETH = 0xe3C063B1BEe9de02eb28352b55D49D85514C67FF;
 
     // ThreatType enum values (match BybitSafeTrapV2.ThreatType)
     uint8 constant TT_NONE = 0;
@@ -44,6 +52,7 @@ contract BybitSafeTrapV2Test is Test {
     // ======================== State ========================
 
     BybitSafeTrapV2 trap;
+    BaselineFeeder feeder;
 
     // Default "healthy" values for synthesizing snapshots
     uint256 constant START_BLOCK = 100;
@@ -53,7 +62,9 @@ contract BybitSafeTrapV2Test is Test {
     address constant BASE_GUARD = address(0xAAAA);
 
     function setUp() public {
-        trap = new BybitSafeTrapV2();
+        feeder = new BaselineFeeder(address(this));
+        feeder.setBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
+        trap = new BybitSafeTrapV2(SAFE_PROXY, address(feeder), STETH, METH, CMETH);
     }
 
     // ======================== Snapshot helpers ========================
@@ -66,16 +77,23 @@ contract BybitSafeTrapV2Test is Test {
         s.masterCopyReadOk = true;
         s.guardReadOk = true;
         s.modulesReadComplete = true;
+        s.balancesReadOk = true;
+        s.baselineConfigured = true;
 
         s.masterCopy = EXPECTED_MASTER_COPY;
-        s.threshold = 3;     // matches EXPECTED_THRESHOLD
-        s.ownerCount = 6;    // matches EXPECTED_OWNER_COUNT
+        s.threshold = 3;
+        s.ownerCount = 6;
         s.ownersHash = BASE_OWNERS_HASH;
         s.nonce = 42;
 
         s.moduleCount = 0;
         s.modulesHash = BASE_MODULES_HASH;
         s.guard = BASE_GUARD;
+
+        s.expectedMasterCopy = EXPECTED_MASTER_COPY;
+        s.expectedThreshold = 3;
+        s.expectedOwnerCount = 6;
+        s.expectedOwnersHash = bytes32(0);
 
         s.ethBalance = BASE_BALANCE;
         s.stethBalance = 0;
@@ -110,7 +128,6 @@ contract BybitSafeTrapV2Test is Test {
         return abi.decode(raw, (BybitSafeTrapV2.IncidentPayload));
     }
 
-    /// @dev Cast the enum-typed threatType to uint8 so stdlib assertEq finds an overload.
     function _tt(BybitSafeTrapV2.IncidentPayload memory p) internal pure returns (uint8) {
         return uint8(p.threatType);
     }
@@ -150,7 +167,7 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_NoTrigger_NonContiguousBlocks() public view {
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - 5); // GAP
+        BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - 5);
         bytes[] memory data = new bytes[](2);
         data[0] = _encode(newest);
         data[1] = _encode(older);
@@ -159,7 +176,6 @@ contract BybitSafeTrapV2Test is Test {
     }
 
     function test_NoTrigger_ReorderedBlocks() public view {
-        // newest has smaller blockNumber than "previous" — ordering violation
         bytes[] memory data = new bytes[](2);
         data[0] = _encode(_healthySnapshot(START_BLOCK));
         data[1] = _encode(_healthySnapshot(START_BLOCK + 1));
@@ -188,6 +204,24 @@ contract BybitSafeTrapV2Test is Test {
         assertFalse(fired);
     }
 
+    // Robust decoder: malformed-length bytes must fail closed, not revert.
+    function test_NoTrigger_MalformedBytes_WrongLength() public view {
+        bytes[] memory data = new bytes[](2);
+        data[0] = _encode(_healthySnapshot(START_BLOCK));
+        data[1] = hex"deadbeef"; // 4 bytes — far short of ENCODED_SNAPSHOT_LEN
+        (bool fired, bytes memory payload) = trap.shouldRespond(data);
+        assertFalse(fired, "malformed-length previous must fail closed");
+        assertEq(payload.length, 0);
+    }
+
+    function test_NoTrigger_MalformedBytes_EmptyPrevious() public view {
+        bytes[] memory data = new bytes[](2);
+        data[0] = _encode(_healthySnapshot(START_BLOCK));
+        data[1] = bytes("");
+        (bool fired, ) = trap.shouldRespond(data);
+        assertFalse(fired);
+    }
+
     // ======================== 3. Threat triggers ========================
 
     function _triggerWith(BybitSafeTrapV2.Snapshot memory newest)
@@ -204,15 +238,30 @@ contract BybitSafeTrapV2Test is Test {
         return (true, _decodeIncident(payload));
     }
 
-    function test_Trigger_MonitoringDegraded() public view {
+    function test_Trigger_MonitoringDegraded_MasterCopyReadFailed() public view {
         BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.masterCopyReadOk = false; // loss of visibility
+        s.masterCopyReadOk = false;
         (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
         assertTrue(fired);
         assertEq(_tt(p), TT_MONITORING_DEGRADED);
         assertEq(p.safeProxy, SAFE_PROXY);
         assertEq(p.currentBlockNumber, START_BLOCK);
         assertEq(p.previousBlockNumber, START_BLOCK - 1);
+    }
+
+    // NEW: balance-read failures feed MonitoringDegraded (Corrections2 #2).
+    function test_Trigger_MonitoringDegraded_BalancesReadFailed() public view {
+        BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
+        s.balancesReadOk = false;
+        (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
+        assertTrue(fired);
+        assertEq(_tt(p), TT_MONITORING_DEGRADED);
+        (bool mcOk, bool gOk, bool modsOk, bool balsOk) =
+            abi.decode(p.details, (bool, bool, bool, bool));
+        assertTrue(mcOk);
+        assertTrue(gOk);
+        assertTrue(modsOk);
+        assertFalse(balsOk, "balancesReadOk must be surfaced in details");
     }
 
     function test_Trigger_ImplementationCompromised() public view {
@@ -236,7 +285,7 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_Trigger_ConfigChanged_AbsoluteThreshold() public view {
         BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.threshold = 1; // breaks EXPECTED_THRESHOLD = 3
+        s.threshold = 1;
         (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
         assertTrue(fired);
         assertEq(_tt(p), TT_CONFIG_CHANGED);
@@ -244,15 +293,28 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_Trigger_ConfigChanged_AbsoluteOwnerCount() public view {
         BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.ownerCount = 2; // breaks EXPECTED_OWNER_COUNT = 6
+        s.ownerCount = 2;
         (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
         assertTrue(fired);
         assertEq(_tt(p), TT_CONFIG_CHANGED);
     }
 
+    // NEW: when baseline is not configured, absolute checks must NOT fire on
+    // default/zero expected values.
+    function test_NoTrigger_BaselineUnconfigured_NoFalseAbsolute() public view {
+        BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
+        s.baselineConfigured = false;
+        s.expectedMasterCopy = address(0);
+        s.expectedThreshold = 0;
+        s.expectedOwnerCount = 0;
+        s.expectedOwnersHash = bytes32(0);
+        // s.masterCopy / threshold / ownerCount stay healthy; previous matches.
+        (bool fired, ) = _triggerWith(s);
+        assertFalse(fired, "unconfigured baseline must not fire absolute checks");
+    }
+
     function test_Trigger_GuardChanged() public view {
         bytes[] memory data = _contiguousWindow(_healthySnapshot(START_BLOCK), 2);
-        // rebuild data[0] with a changed guard vs data[1]
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
         newest.guard = address(0xBEEF);
         data[0] = _encode(newest);
@@ -265,7 +327,7 @@ contract BybitSafeTrapV2Test is Test {
     function test_Trigger_ModulesChanged() public view {
         bytes[] memory data = _contiguousWindow(_healthySnapshot(START_BLOCK), 2);
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        newest.moduleCount = 1; // previous had 0
+        newest.moduleCount = 1;
         newest.modulesHash = keccak256("new-modules");
         data[0] = _encode(newest);
         (bool fired, bytes memory payload) = trap.shouldRespond(data);
@@ -274,14 +336,12 @@ contract BybitSafeTrapV2Test is Test {
     }
 
     function test_NoTrigger_ModulesChanged_PreviousIncompleteRead() public view {
-        // If previous had an incomplete module read, we must NOT fire a relative
-        // modules-changed — the diff is an artifact of the truncated read.
         bytes[] memory data = new bytes[](2);
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
         newest.moduleCount = 2;
         newest.modulesHash = keccak256("x");
         BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - 1);
-        older.modulesReadComplete = false; // previous was truncated
+        older.modulesReadComplete = false;
         older.moduleCount = 1;
         older.modulesHash = keccak256("y");
         data[0] = _encode(newest);
@@ -301,9 +361,8 @@ contract BybitSafeTrapV2Test is Test {
     }
 
     function test_Trigger_BalanceDrain_SingleBlock() public view {
-        // 5% drop in one block
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        newest.ethBalance = (BASE_BALANCE * 9500) / 10_000; // 95% remaining
+        newest.ethBalance = (BASE_BALANCE * 9500) / 10_000;
         newest.aggregateBalance = newest.ethBalance;
         (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(newest);
         assertTrue(fired);
@@ -316,9 +375,6 @@ contract BybitSafeTrapV2Test is Test {
     }
 
     function test_NoTrigger_BalanceDrain_JustBelowThreshold() public view {
-        // 4.99% drop — should NOT fire BalanceDrain (but might fire GradualDrain
-        // across the full 10-block window if cumulative >= 15%; not here since
-        // only the newest block is lower)
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
         newest.ethBalance = (BASE_BALANCE * 9501) / 10_000;
         newest.aggregateBalance = newest.ethBalance;
@@ -326,27 +382,24 @@ contract BybitSafeTrapV2Test is Test {
         assertFalse(fired);
     }
 
-    function test_Trigger_GradualDrain() public view {
-        // Newest drops 16% vs oldest in the window (per-block drop just under
-        // the single-block threshold, but cumulative >= 15%)
+    // NEW: a degraded previous snapshot must not let a bogus balance diff look
+    // like a drain.
+    function test_NoTrigger_BalanceDrain_PreviousBalancesDegraded() public view {
+        bytes[] memory data = new bytes[](2);
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        newest.ethBalance = (BASE_BALANCE * 8400) / 10_000;
+        newest.ethBalance = (BASE_BALANCE * 9000) / 10_000; // 10% drop — would trigger
         newest.aggregateBalance = newest.ethBalance;
-        // Build window: prev block just 0.5% lower than oldest (no single-block trigger)
-        bytes[] memory data = new bytes[](10);
+        BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - 1);
+        older.balancesReadOk = false;
         data[0] = _encode(newest);
-        for (uint256 i = 1; i < 10; i++) {
-            BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - i);
-            // Keep oldest at BASE_BALANCE, slightly lower on each newer one
-            older.ethBalance = BASE_BALANCE - (i == 1 ? (BASE_BALANCE / 200) : 0);
-            older.aggregateBalance = older.ethBalance;
-            data[i] = _encode(older);
-        }
-        // ensure data[1] (previous vs newest) drop is < 5% single-block:
-        // data[1] = 995 eth, newest = 840 eth -> 15.6% single-block, triggers BalanceDrain first.
-        // Rewrite: shift so single-block diff stays under 5%. Set every prior sample to 1000 eth
-        // and newest to 850 eth? 15% single-block = exactly at BalanceDrain threshold, still fires.
-        // Use newest = 841 (15.9% vs oldest 1000), data[1] = 880 (4.4% vs 841 newest). Rebuild.
+        data[1] = _encode(older);
+        (bool fired, ) = trap.shouldRespond(data);
+        assertFalse(fired, "degraded previous must suppress drain");
+    }
+
+    function test_Trigger_GradualDrain() public view {
+        bytes[] memory data = new bytes[](10);
+        BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
         newest.ethBalance = 841 ether;
         newest.aggregateBalance = 841 ether;
         data[0] = _encode(newest);
@@ -354,7 +407,7 @@ contract BybitSafeTrapV2Test is Test {
             BybitSafeTrapV2.Snapshot memory older = _healthySnapshot(START_BLOCK - i);
             uint256 bal;
             if (i == 1) bal = 880 ether;          // 4.4% drop single-block vs newest
-            else bal = BASE_BALANCE;               // oldest untouched at 1000
+            else bal = BASE_BALANCE;
             older.ethBalance = bal;
             older.aggregateBalance = bal;
             data[i] = _encode(older);
@@ -366,7 +419,7 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_Trigger_NonceJump() public view {
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        newest.nonce = 42 + 6; // jump > MAX_NONCE_JUMP (5) vs previous (42)
+        newest.nonce = 42 + 6;
         (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(newest);
         assertTrue(fired);
         assertEq(_tt(p), TT_NONCE_JUMP);
@@ -374,7 +427,7 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_NoTrigger_NonceJump_AtThreshold() public view {
         BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
-        newest.nonce = 42 + 5; // exactly MAX_NONCE_JUMP — should NOT fire ( > 5)
+        newest.nonce = 42 + 5;
         (bool fired, ) = _triggerWith(newest);
         assertFalse(fired);
     }
@@ -398,24 +451,24 @@ contract BybitSafeTrapV2Test is Test {
     }
 
     // ======================== 5. Fork-based Bybit reproduction ========================
-    //
-    // Fork tests exercise collect() against real Safe storage at the exploit
-    // blocks. Foundry forks expose a known getStorageAt quirk (see feedback
-    // memory): the call returns empty bytes in fork contexts, so V2 correctly
-    // reports `masterCopyReadOk = false`. Real operator RPCs don't have this
-    // limitation. These tests therefore assert on what's reliably observable on
-    // forks: implementationValid, safeProxy binding, blockNumber, balances.
-    // The synthetic tests above cover every shouldRespond path deterministically.
+
+    function _deployLiveTrap() internal returns (BybitSafeTrapV2) {
+        BaselineFeeder f = new BaselineFeeder(address(this));
+        f.setBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
+        return new BybitSafeTrapV2(SAFE_PROXY, address(f), STETH, METH, CMETH);
+    }
 
     function test_Fork_PreExploit_CollectHealthy() public {
         vm.createSelectFork("mainnet", PRE_EXPLOIT_BLOCK);
-        BybitSafeTrapV2 liveTrap = new BybitSafeTrapV2();
+        BybitSafeTrapV2 liveTrap = _deployLiveTrap();
         BybitSafeTrapV2.Snapshot memory s =
             abi.decode(liveTrap.collect(), (BybitSafeTrapV2.Snapshot));
 
         assertEq(s.safeProxy, SAFE_PROXY, "snapshot must bind to SAFE_PROXY");
         assertEq(s.blockNumber, PRE_EXPLOIT_BLOCK, "blockNumber must equal fork block");
         assertTrue(s.implementationValid, "pre-exploit Safe functions must succeed");
+        assertTrue(s.baselineConfigured, "baseline was set in _deployLiveTrap");
+        assertEq(s.expectedMasterCopy, EXPECTED_MASTER_COPY);
         assertEq(s.threshold, 3);
         assertGt(s.ownerCount, 0);
         assertGt(s.ethBalance, 400_000 ether, "pre-exploit must hold >400k ETH");
@@ -423,7 +476,7 @@ contract BybitSafeTrapV2Test is Test {
 
     function test_Fork_AtSwap_ImplementationInvalid() public {
         vm.createSelectFork("mainnet", MASTERCOPY_SWAP_BLOCK);
-        BybitSafeTrapV2 liveTrap = new BybitSafeTrapV2();
+        BybitSafeTrapV2 liveTrap = _deployLiveTrap();
         BybitSafeTrapV2.Snapshot memory s =
             abi.decode(liveTrap.collect(), (BybitSafeTrapV2.Snapshot));
 
@@ -432,43 +485,39 @@ contract BybitSafeTrapV2Test is Test {
         assertFalse(s.implementationValid, "post-swap Safe functions must revert");
         assertGt(s.ethBalance, 400_000 ether, "ETH still in wallet 18 blocks before drain");
 
-        // Prove the on-chain swap actually happened (via vm.load, bypassing the
-        // getStorageAt fork quirk).
         bytes32 slot0 = vm.load(SAFE_PROXY, bytes32(uint256(0)));
         address swapped = address(uint160(uint256(slot0)));
         assertTrue(swapped != EXPECTED_MASTER_COPY, "slot 0 was overwritten on-chain");
     }
 
     function test_Fork_AtSwap_TrapFiresImplementationCompromised() public {
-        // Collect both snapshots from the real forks, then normalize the fork-
-        // only getStorageAt read flags so the MonitoringDegraded branch steps
-        // aside and we prove the next-priority branch fires. In production this
-        // normalization is unnecessary — real RPCs return those reads correctly.
+        // Fork Foundry has a known getStorageAt quirk returning empty bytes, so
+        // masterCopyReadOk / guardReadOk / modulesReadComplete come back false
+        // and MonitoringDegraded would fire. We normalize those flags before
+        // exercising the ImplementationCompromised branch — the real Bybit
+        // signal on a production RPC. Balance reads work fine on forks so we
+        // leave balancesReadOk alone.
         vm.createSelectFork("mainnet", PRE_EXPLOIT_BLOCK);
-        BybitSafeTrapV2.Snapshot memory pre = abi.decode(
-            (new BybitSafeTrapV2()).collect(),
-            (BybitSafeTrapV2.Snapshot)
-        );
+        BybitSafeTrapV2 preTrap = _deployLiveTrap();
+        BybitSafeTrapV2.Snapshot memory pre = abi.decode(preTrap.collect(), (BybitSafeTrapV2.Snapshot));
 
         vm.createSelectFork("mainnet", MASTERCOPY_SWAP_BLOCK);
-        BybitSafeTrapV2 swapLive = new BybitSafeTrapV2();
+        BybitSafeTrapV2 swapLive = _deployLiveTrap();
         BybitSafeTrapV2.Snapshot memory post =
             abi.decode(swapLive.collect(), (BybitSafeTrapV2.Snapshot));
 
-        // Normalize fork-only read limitations
         pre.masterCopyReadOk = true;
         pre.guardReadOk = true;
         pre.modulesReadComplete = true;
+        pre.balancesReadOk = true;
         pre.masterCopy = EXPECTED_MASTER_COPY;
 
         post.masterCopyReadOk = true;
         post.guardReadOk = true;
         post.modulesReadComplete = true;
-        post.masterCopy = EXPECTED_MASTER_COPY; // skip MasterCopyChanged path; the
-                                                // *real* detection signal on Bybit
-                                                // is implementationValid = false
+        post.balancesReadOk = true;
+        post.masterCopy = EXPECTED_MASTER_COPY;
 
-        // Contiguous window
         post.blockNumber = PRE_EXPLOIT_BLOCK + 1;
         pre.blockNumber = PRE_EXPLOIT_BLOCK;
 
@@ -484,6 +533,79 @@ contract BybitSafeTrapV2Test is Test {
         assertEq(p.safeProxy, SAFE_PROXY);
         assertEq(p.currentBlockNumber, PRE_EXPLOIT_BLOCK + 1);
         assertEq(p.previousBlockNumber, PRE_EXPLOIT_BLOCK);
+    }
+}
+
+// ============================================================================
+//                     BaselineFeeder tests
+// ============================================================================
+
+contract BaselineFeederTest is Test {
+    BaselineFeeder feeder;
+    address constant SAFE = 0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4;
+    address constant MC = 0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F;
+    address admin = address(0xA11CE);
+    address outsider = address(0xDEAD);
+
+    function setUp() public {
+        feeder = new BaselineFeeder(admin);
+    }
+
+    function test_Set_OnlyOwner() public {
+        vm.prank(outsider);
+        vm.expectRevert(bytes("not owner"));
+        feeder.setBaseline(SAFE, MC, 3, 6, bytes32(0));
+    }
+
+    function test_Set_RejectsInvalid() public {
+        vm.startPrank(admin);
+        vm.expectRevert(bytes("zero safe"));
+        feeder.setBaseline(address(0), MC, 3, 6, bytes32(0));
+        vm.expectRevert(bytes("zero masterCopy"));
+        feeder.setBaseline(SAFE, address(0), 3, 6, bytes32(0));
+        vm.expectRevert(bytes("zero threshold"));
+        feeder.setBaseline(SAFE, MC, 0, 6, bytes32(0));
+        vm.expectRevert(bytes("zero ownerCount"));
+        feeder.setBaseline(SAFE, MC, 3, 0, bytes32(0));
+        vm.expectRevert(bytes("threshold > owners"));
+        feeder.setBaseline(SAFE, MC, 10, 6, bytes32(0));
+        vm.stopPrank();
+    }
+
+    function test_Set_AndRead() public {
+        vm.prank(admin);
+        feeder.setBaseline(SAFE, MC, 3, 6, keccak256("hash"));
+        BaselineFeeder.Baseline memory b = feeder.getBaseline(SAFE);
+        assertTrue(b.configured);
+        assertEq(b.masterCopy, MC);
+        assertEq(b.threshold, 3);
+        assertEq(b.ownerCount, 6);
+        assertEq(b.ownersHash, keccak256("hash"));
+    }
+
+    function test_ClearBaseline() public {
+        vm.startPrank(admin);
+        feeder.setBaseline(SAFE, MC, 3, 6, bytes32(0));
+        feeder.clearBaseline(SAFE);
+        vm.stopPrank();
+        BaselineFeeder.Baseline memory b = feeder.getBaseline(SAFE);
+        assertFalse(b.configured);
+    }
+
+    function test_UnsetBaseline_ReturnsUnconfigured() public view {
+        BaselineFeeder.Baseline memory b = feeder.getBaseline(SAFE);
+        assertFalse(b.configured);
+        assertEq(b.masterCopy, address(0));
+    }
+
+    function test_SetOwner_OnlyOwner() public {
+        vm.prank(outsider);
+        vm.expectRevert(bytes("not owner"));
+        feeder.setOwner(outsider);
+
+        vm.prank(admin);
+        feeder.setOwner(outsider);
+        assertEq(feeder.owner(), outsider);
     }
 }
 
@@ -674,13 +796,54 @@ contract SafeGuardResponderV2Test is Test {
         registry.setTarget(address(0x1234), true);
     }
 
-    function test_Registry_ApprovedTargetsAreUniqueInList() public {
+    function test_Registry_DuplicateApprovalDoesNotDuplicateEntry() public {
         address extra = address(0x1234);
         vm.startPrank(admin);
         registry.setTarget(extra, true);
-        registry.setTarget(extra, true); // duplicate approval
+        registry.setTarget(extra, true);
         vm.stopPrank();
-        // targets array: [targetA, targetB, extra] — no duplicate
         assertEq(registry.targetsLength(), 3);
+    }
+
+    // NEW (Corrections2 #1): revoke-then-reapprove must not push a duplicate.
+    function test_Registry_RevokeAndReapproveDoesNotDuplicate() public {
+        address extra = address(0x1234);
+        vm.startPrank(admin);
+        registry.setTarget(extra, true);   // push #1
+        registry.setTarget(extra, false);  // revoke
+        registry.setTarget(extra, true);   // re-approve — previously pushed again
+        vm.stopPrank();
+
+        assertEq(registry.targetsLength(), 3, "must not re-push after revoke");
+        // And the flag is back to true.
+        assertTrue(registry.approvedTargets(extra));
+    }
+
+    // NEW: responder fan-out cannot double-call a re-approved target.
+    function test_FanOut_NoDuplicateCallAfterRevokeReapprove() public {
+        vm.startPrank(admin);
+        registry.setTarget(address(targetA), false);
+        registry.setTarget(address(targetA), true);
+        vm.stopPrank();
+
+        vm.prank(relayer);
+        responder.handleIncident(_samplePayload());
+        assertEq(targetA.pauseCount(), 1, "A must be called exactly once");
+        assertEq(targetB.pauseCount(), 1);
+    }
+
+    // NEW (Corrections2 #3): registry enforces a hard cap on targets.
+    function test_Registry_MaxTargetsBound() public {
+        // targets already has 2 entries (targetA, targetB) from setUp().
+        uint256 remaining = registry.MAX_TARGETS() - registry.targetsLength();
+        vm.startPrank(admin);
+        for (uint256 i = 0; i < remaining; i++) {
+            registry.setTarget(address(uint160(0x10000 + i)), true);
+        }
+        // One more must revert.
+        vm.expectRevert(bytes("max targets"));
+        registry.setTarget(address(0xDEAD0001), true);
+        vm.stopPrank();
+        assertEq(registry.targetsLength(), registry.MAX_TARGETS());
     }
 }
