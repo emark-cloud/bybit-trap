@@ -6,6 +6,7 @@ import {BybitSafeTrapV2} from "../src/BybitSafeTrapV2.sol";
 import {BaselineFeeder} from "../src/BaselineFeeder.sol";
 import {SafeGuardResponderV2} from "../src/SafeGuardResponderV2.sol";
 import {SafeGuardianRegistry} from "../src/SafeGuardianRegistry.sol";
+import {TrapDeployConfig} from "../src/TrapDeployConfig.sol";
 import {MockGuardianTarget} from "../src/mocks/MockGuardianTarget.sol";
 
 interface ISafeV2 {
@@ -15,14 +16,18 @@ interface ISafeV2 {
 
 /// @title BybitSafeTrapV2 + SafeGuardResponderV2 full test suite
 /// @notice Covers:
+///         - Constructorless trap wiring through TrapDeployConfig + feeder
+///           overlaid at the configured address via `deployCodeTo`
 ///         - Synthetic shouldRespond logic (no fork required)
 ///         - BaselineFeeder-driven absolute checks + unconfigured-baseline path
-///         - Balance-read degradation feeding MonitoringDegraded
+///         - Read-failure flags (masterCopy / balances / baseline) feeding
+///           MonitoringDegraded only after two consecutive degraded samples
 ///         - Malformed-bytes robustness (length check + failing closed)
 ///         - Sample-ordering + safeProxy-binding validation
 ///         - Every ThreatType trigger
 ///         - Live mainnet fork proving ImplementationCompromised fires at the real swap block
-///         - Responder idempotency, allowlist, relayer, global pause, registry fan-out
+///         - Responder idempotency, retry-after-failure, allowlist, relayer,
+///           global pause, registry fan-out
 ///         - Registry duplicate-target bug fix + MAX_TARGETS bound
 contract BybitSafeTrapV2Test is Test {
     // ======================== Constants ========================
@@ -30,6 +35,8 @@ contract BybitSafeTrapV2Test is Test {
     uint256 constant MASTERCOPY_SWAP_BLOCK = 21_895_238;
     uint256 constant PRE_EXPLOIT_BLOCK = MASTERCOPY_SWAP_BLOCK - 1;
 
+    // Mirror TrapDeployConfig so test asserts stay readable and break loudly
+    // if anyone edits the deploy config without re-checking the test surface.
     address constant SAFE_PROXY = 0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4;
     address constant EXPECTED_MASTER_COPY = 0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F;
 
@@ -62,9 +69,51 @@ contract BybitSafeTrapV2Test is Test {
     address constant BASE_GUARD = address(0xAAAA);
 
     function setUp() public {
-        feeder = new BaselineFeeder(address(this));
-        feeder.setBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
-        trap = new BybitSafeTrapV2(SAFE_PROXY, address(feeder), STETH, METH, CMETH);
+        // The trap takes no constructor args (Drosera deployment model), so
+        // the BaselineFeeder must live at the address baked into
+        // TrapDeployConfig. We overlay a fresh feeder there via `vm.etch` and
+        // seed its storage via `vm.store` — both are pure local writes that
+        // avoid the copy-on-write storage fetch a real SSTORE would trigger
+        // on a forked environment (the latter times out on the free-tier
+        // archive RPC).
+        _installFeeder();
+        _seedBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
+        feeder = BaselineFeeder(TrapDeployConfig.BASELINE_FEEDER);
+        trap = new BybitSafeTrapV2();
+    }
+
+    /// @dev Overlay BaselineFeeder runtime code at TrapDeployConfig.BASELINE_FEEDER.
+    function _installFeeder() internal {
+        BaselineFeeder template = new BaselineFeeder(address(this));
+        vm.etch(TrapDeployConfig.BASELINE_FEEDER, address(template).code);
+        // Pre-set owner (slot 0) so any future onlyOwner call also stays local.
+        vm.store(
+            TrapDeployConfig.BASELINE_FEEDER,
+            bytes32(uint256(0)),
+            bytes32(uint256(uint160(address(this))))
+        );
+    }
+
+    /// @dev Write the Baseline struct directly into storage at the slot the
+    ///      compiler would use for `_baselines[safe]`. BaselineFeeder layout:
+    ///        slot 0: owner
+    ///        slot 1: mapping(address => Baseline) _baselines
+    ///      Baseline (5 single-word fields):
+    ///        +0 masterCopy, +1 threshold, +2 ownerCount, +3 ownersHash, +4 configured
+    function _seedBaseline(
+        address safe,
+        address masterCopy_,
+        uint256 threshold_,
+        uint256 ownerCount_,
+        bytes32 ownersHash_
+    ) internal {
+        bytes32 baseSlot = keccak256(abi.encode(safe, uint256(1)));
+        address f = TrapDeployConfig.BASELINE_FEEDER;
+        vm.store(f, baseSlot,                                bytes32(uint256(uint160(masterCopy_))));
+        vm.store(f, bytes32(uint256(baseSlot) + 1),          bytes32(threshold_));
+        vm.store(f, bytes32(uint256(baseSlot) + 2),          bytes32(ownerCount_));
+        vm.store(f, bytes32(uint256(baseSlot) + 3),          ownersHash_);
+        vm.store(f, bytes32(uint256(baseSlot) + 4),          bytes32(uint256(1))); // configured
     }
 
     // ======================== Snapshot helpers ========================
@@ -78,6 +127,7 @@ contract BybitSafeTrapV2Test is Test {
         s.guardReadOk = true;
         s.modulesReadComplete = true;
         s.balancesReadOk = true;
+        s.baselineReadOk = true;
         s.baselineConfigured = true;
 
         s.masterCopy = EXPECTED_MASTER_COPY;
@@ -238,30 +288,88 @@ contract BybitSafeTrapV2Test is Test {
         return (true, _decodeIncident(payload));
     }
 
-    function test_Trigger_MonitoringDegraded_MasterCopyReadFailed() public view {
-        BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.masterCopyReadOk = false;
-        (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
+    /// @dev Two-element window where both samples carry the same degradation
+    ///      mutator applied to a healthy base. MonitoringDegraded requires
+    ///      sustained degradation across consecutive samples.
+    function _twoSampleDegradedWindow(
+        function(BybitSafeTrapV2.Snapshot memory) internal pure returns (BybitSafeTrapV2.Snapshot memory) mutate
+    ) internal pure returns (bytes[] memory data) {
+        BybitSafeTrapV2.Snapshot memory newest = mutate(_healthySnapshot(START_BLOCK));
+        BybitSafeTrapV2.Snapshot memory previous = mutate(_healthySnapshot(START_BLOCK - 1));
+        data = new bytes[](2);
+        data[0] = _encode(newest);
+        data[1] = _encode(previous);
+    }
+
+    function _failMasterCopy(BybitSafeTrapV2.Snapshot memory s)
+        internal pure returns (BybitSafeTrapV2.Snapshot memory)
+    { s.masterCopyReadOk = false; return s; }
+
+    function _failBalances(BybitSafeTrapV2.Snapshot memory s)
+        internal pure returns (BybitSafeTrapV2.Snapshot memory)
+    { s.balancesReadOk = false; return s; }
+
+    function _failBaseline(BybitSafeTrapV2.Snapshot memory s)
+        internal pure returns (BybitSafeTrapV2.Snapshot memory)
+    { s.baselineReadOk = false; return s; }
+
+    function test_Trigger_MonitoringDegraded_MasterCopyReadFailedPersistent() public view {
+        bytes[] memory data = _twoSampleDegradedWindow(_failMasterCopy);
+        (bool fired, bytes memory payload) = trap.shouldRespond(data);
         assertTrue(fired);
+        BybitSafeTrapV2.IncidentPayload memory p = _decodeIncident(payload);
         assertEq(_tt(p), TT_MONITORING_DEGRADED);
         assertEq(p.safeProxy, SAFE_PROXY);
         assertEq(p.currentBlockNumber, START_BLOCK);
         assertEq(p.previousBlockNumber, START_BLOCK - 1);
     }
 
-    // NEW: balance-read failures feed MonitoringDegraded (Corrections2 #2).
-    function test_Trigger_MonitoringDegraded_BalancesReadFailed() public view {
-        BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.balancesReadOk = false;
-        (bool fired, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
+    // Balance-read failures feed MonitoringDegraded when sustained for two samples.
+    function test_Trigger_MonitoringDegraded_BalancesReadFailedPersistent() public view {
+        bytes[] memory data = _twoSampleDegradedWindow(_failBalances);
+        (bool fired, bytes memory payload) = trap.shouldRespond(data);
         assertTrue(fired);
+        BybitSafeTrapV2.IncidentPayload memory p = _decodeIncident(payload);
         assertEq(_tt(p), TT_MONITORING_DEGRADED);
-        (bool mcOk, bool gOk, bool modsOk, bool balsOk) =
-            abi.decode(p.details, (bool, bool, bool, bool));
+        (
+            bool mcOk, bool gOk, bool modsOk, bool balsOk, bool baseOk,
+            bool prevMcOk, bool prevGOk, bool prevModsOk, bool prevBalsOk, bool prevBaseOk
+        ) = abi.decode(p.details, (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool));
         assertTrue(mcOk);
         assertTrue(gOk);
         assertTrue(modsOk);
         assertFalse(balsOk, "balancesReadOk must be surfaced in details");
+        assertTrue(baseOk);
+        assertTrue(prevMcOk);
+        assertTrue(prevGOk);
+        assertTrue(prevModsOk);
+        assertFalse(prevBalsOk, "previous.balancesReadOk must also be surfaced");
+        assertTrue(prevBaseOk);
+    }
+
+    // Baseline-feeder failures feed MonitoringDegraded when sustained.
+    function test_Trigger_MonitoringDegraded_BaselineReadFailedPersistent() public view {
+        bytes[] memory data = _twoSampleDegradedWindow(_failBaseline);
+        (bool fired, bytes memory payload) = trap.shouldRespond(data);
+        assertTrue(fired);
+        BybitSafeTrapV2.IncidentPayload memory p = _decodeIncident(payload);
+        assertEq(_tt(p), TT_MONITORING_DEGRADED);
+    }
+
+    // A single bad sample must NOT auto-pause — debounce across two samples
+    // to absorb RPC blips.
+    function test_NoTrigger_SingleSampleMonitoringDegraded() public view {
+        BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
+        BybitSafeTrapV2.Snapshot memory previous = _healthySnapshot(START_BLOCK - 1);
+        newest.balancesReadOk = false;
+        previous.balancesReadOk = true;
+
+        bytes[] memory data = new bytes[](2);
+        data[0] = _encode(newest);
+        data[1] = _encode(previous);
+
+        (bool fired, ) = trap.shouldRespond(data);
+        assertFalse(fired, "single degraded sample should not auto-respond");
     }
 
     function test_Trigger_ImplementationCompromised() public view {
@@ -299,7 +407,7 @@ contract BybitSafeTrapV2Test is Test {
         assertEq(_tt(p), TT_CONFIG_CHANGED);
     }
 
-    // NEW: when baseline is not configured, absolute checks must NOT fire on
+    // When baseline is not configured, absolute checks must NOT fire on
     // default/zero expected values.
     function test_NoTrigger_BaselineUnconfigured_NoFalseAbsolute() public view {
         BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
@@ -382,7 +490,7 @@ contract BybitSafeTrapV2Test is Test {
         assertFalse(fired);
     }
 
-    // NEW: a degraded previous snapshot must not let a bogus balance diff look
+    // A degraded previous snapshot must not let a bogus balance diff look
     // like a drain.
     function test_NoTrigger_BalanceDrain_PreviousBalancesDegraded() public view {
         bytes[] memory data = new bytes[](2);
@@ -435,11 +543,21 @@ contract BybitSafeTrapV2Test is Test {
     // ======================== 4. Priority ordering ========================
 
     function test_Priority_MonitoringDegradedBeatsImplementation() public view {
-        BybitSafeTrapV2.Snapshot memory s = _healthySnapshot(START_BLOCK);
-        s.masterCopyReadOk = false;
-        s.implementationValid = false;
-        (, BybitSafeTrapV2.IncidentPayload memory p) = _triggerWith(s);
-        assertEq(_tt(p), TT_MONITORING_DEGRADED);
+        // Sustained masterCopy-read failure across both samples preempts the
+        // implementationValid signal.
+        BybitSafeTrapV2.Snapshot memory newest = _healthySnapshot(START_BLOCK);
+        BybitSafeTrapV2.Snapshot memory previous = _healthySnapshot(START_BLOCK - 1);
+        newest.masterCopyReadOk = false;
+        newest.implementationValid = false;
+        previous.masterCopyReadOk = false;
+
+        bytes[] memory data = new bytes[](2);
+        data[0] = _encode(newest);
+        data[1] = _encode(previous);
+
+        (bool fired, bytes memory payload) = trap.shouldRespond(data);
+        assertTrue(fired);
+        assertEq(_tt(_decodeIncident(payload)), TT_MONITORING_DEGRADED);
     }
 
     function test_Priority_ImplementationBeatsMasterCopy() public view {
@@ -453,9 +571,12 @@ contract BybitSafeTrapV2Test is Test {
     // ======================== 5. Fork-based Bybit reproduction ========================
 
     function _deployLiveTrap() internal returns (BybitSafeTrapV2) {
-        BaselineFeeder f = new BaselineFeeder(address(this));
-        f.setBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
-        return new BybitSafeTrapV2(SAFE_PROXY, address(f), STETH, METH, CMETH);
+        // Re-overlay the feeder on the freshly selected fork (forking wipes
+        // state at the constant address) and re-seed the baseline directly
+        // into storage to avoid CoW reads against the free-tier archive RPC.
+        _installFeeder();
+        _seedBaseline(SAFE_PROXY, EXPECTED_MASTER_COPY, 3, 6, bytes32(0));
+        return new BybitSafeTrapV2();
     }
 
     function test_Fork_PreExploit_CollectHealthy() public {
@@ -467,6 +588,7 @@ contract BybitSafeTrapV2Test is Test {
         assertEq(s.safeProxy, SAFE_PROXY, "snapshot must bind to SAFE_PROXY");
         assertEq(s.blockNumber, PRE_EXPLOIT_BLOCK, "blockNumber must equal fork block");
         assertTrue(s.implementationValid, "pre-exploit Safe functions must succeed");
+        assertTrue(s.baselineReadOk, "overlaid feeder read must succeed");
         assertTrue(s.baselineConfigured, "baseline was set in _deployLiveTrap");
         assertEq(s.expectedMasterCopy, EXPECTED_MASTER_COPY);
         assertEq(s.threshold, 3);
@@ -495,8 +617,8 @@ contract BybitSafeTrapV2Test is Test {
         // masterCopyReadOk / guardReadOk / modulesReadComplete come back false
         // and MonitoringDegraded would fire. We normalize those flags before
         // exercising the ImplementationCompromised branch — the real Bybit
-        // signal on a production RPC. Balance reads work fine on forks so we
-        // leave balancesReadOk alone.
+        // signal on a production RPC. Balance + baseline reads work fine so we
+        // leave those alone.
         vm.createSelectFork("mainnet", PRE_EXPLOIT_BLOCK);
         BybitSafeTrapV2 preTrap = _deployLiveTrap();
         BybitSafeTrapV2.Snapshot memory pre = abi.decode(preTrap.collect(), (BybitSafeTrapV2.Snapshot));
@@ -510,12 +632,14 @@ contract BybitSafeTrapV2Test is Test {
         pre.guardReadOk = true;
         pre.modulesReadComplete = true;
         pre.balancesReadOk = true;
+        pre.baselineReadOk = true;
         pre.masterCopy = EXPECTED_MASTER_COPY;
 
         post.masterCopyReadOk = true;
         post.guardReadOk = true;
         post.modulesReadComplete = true;
         post.balancesReadOk = true;
+        post.baselineReadOk = true;
         post.masterCopy = EXPECTED_MASTER_COPY;
 
         post.blockNumber = PRE_EXPLOIT_BLOCK + 1;
@@ -788,6 +912,48 @@ contract SafeGuardResponderV2Test is Test {
         assertEq(responder.incidentCount(), 1);
     }
 
+    // ---------- retry-after-failure ----------
+
+    // If every approved target reverts, the responder must revert too and
+    // must NOT mark the incident as executed, so a retry after the operator
+    // un-bricks at least one hook still has effect.
+    function test_Response_AllTargetsFail_DoesNotMarkExecuted() public {
+        targetA.setRevertOnPause(true);
+        targetB.setRevertOnPause(true);
+
+        bytes memory payload = _samplePayload();
+
+        vm.prank(relayer);
+        vm.expectRevert(bytes("no target paused"));
+        responder.handleIncident(payload);
+
+        bytes32 incidentHash = keccak256(payload);
+        assertFalse(responder.executedIncidentHash(incidentHash));
+        assertEq(responder.incidentCount(), 0);
+    }
+
+    function test_Response_RetrySucceedsAfterInitialFailure() public {
+        targetA.setRevertOnPause(true);
+        targetB.setRevertOnPause(true);
+
+        bytes memory payload = _samplePayload();
+
+        vm.prank(relayer);
+        vm.expectRevert(bytes("no target paused"));
+        responder.handleIncident(payload);
+
+        // Operator fixes target A; retry must now go through.
+        targetA.setRevertOnPause(false);
+
+        vm.prank(relayer);
+        responder.handleIncident(payload);
+
+        bytes32 incidentHash = keccak256(payload);
+        assertTrue(responder.executedIncidentHash(incidentHash));
+        assertEq(responder.incidentCount(), 1);
+        assertTrue(targetA.paused());
+    }
+
     // ---------- registry ----------
 
     function test_Registry_OnlyOwnerCanSetTarget() public {
@@ -805,7 +971,7 @@ contract SafeGuardResponderV2Test is Test {
         assertEq(registry.targetsLength(), 3);
     }
 
-    // NEW (Corrections2 #1): revoke-then-reapprove must not push a duplicate.
+    // Revoke-then-reapprove must not push a duplicate.
     function test_Registry_RevokeAndReapproveDoesNotDuplicate() public {
         address extra = address(0x1234);
         vm.startPrank(admin);
@@ -815,11 +981,10 @@ contract SafeGuardResponderV2Test is Test {
         vm.stopPrank();
 
         assertEq(registry.targetsLength(), 3, "must not re-push after revoke");
-        // And the flag is back to true.
         assertTrue(registry.approvedTargets(extra));
     }
 
-    // NEW: responder fan-out cannot double-call a re-approved target.
+    // Responder fan-out cannot double-call a re-approved target.
     function test_FanOut_NoDuplicateCallAfterRevokeReapprove() public {
         vm.startPrank(admin);
         registry.setTarget(address(targetA), false);
@@ -832,7 +997,7 @@ contract SafeGuardResponderV2Test is Test {
         assertEq(targetB.pauseCount(), 1);
     }
 
-    // NEW (Corrections2 #3): registry enforces a hard cap on targets.
+    // Registry enforces a hard cap on targets.
     function test_Registry_MaxTargetsBound() public {
         // targets already has 2 entries (targetA, targetB) from setUp().
         uint256 remaining = registry.MAX_TARGETS() - registry.targetsLength();

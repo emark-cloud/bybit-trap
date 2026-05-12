@@ -118,6 +118,14 @@ contract SafeGuardResponderV2 {
 
     /// @notice Drosera-configured response function. Signature must match
     ///         drosera.toml `response_function = "handleIncident(bytes)"`.
+    ///
+    /// @dev    Marks the incident as executed only AFTER at least one approved
+    ///         target accepted the pause. If every approved target reverts (or
+    ///         none are approved), the call reverts and the incident hash is
+    ///         left clear so a retry — after the operator un-bricks at least
+    ///         one downstream pause hook — can still take effect. Replaying an
+    ///         already-paused incident is a cheap no-op (idempotency check
+    ///         runs before fan-out).
     function handleIncident(bytes calldata rawPayload) external onlyAuthorizedCaller {
         require(!globallyPaused, "responder paused");
 
@@ -128,10 +136,40 @@ contract SafeGuardResponderV2 {
 
         bytes32 incidentHash = keccak256(rawPayload);
 
-        // Idempotent — replays are no-ops.
+        // Idempotent — replays of an already-handled incident are no-ops and
+        // must NOT re-enter the fan-out loop.
         if (executedIncidentHash[incidentHash]) {
             return;
         }
+
+        // Fan out to every approved emergency target. Track both attempted
+        // and successful pauses — if none succeed, revert so the operator can
+        // retry once at least one downstream hook is healthy again.
+        address[] memory targets = registry.getTargets();
+
+        uint256 attemptedCount;
+        uint256 successCount;
+
+        for (uint256 i = 0; i < targets.length; i++) {
+            address target = targets[i];
+            if (!registry.approvedTargets(target)) continue;
+
+            attemptedCount++;
+
+            bool success;
+            try IEmergencyActionTarget(target).emergencyPause(rawPayload) {
+                success = true;
+                successCount++;
+            } catch {
+                success = false;
+            }
+
+            emit DownstreamPauseAttempt(target, success);
+        }
+
+        require(attemptedCount > 0, "no approved targets");
+        require(successCount > 0, "no target paused");
+
         executedIncidentHash[incidentHash] = true;
 
         incidentCount++;
@@ -149,21 +187,5 @@ contract SafeGuardResponderV2 {
             payload.previousBlockNumber,
             payload.details
         );
-
-        // Fan out to every approved emergency target.
-        address[] memory targets = registry.getTargets();
-        for (uint256 i = 0; i < targets.length; i++) {
-            address target = targets[i];
-            if (!registry.approvedTargets(target)) continue;
-
-            bool success;
-            try IEmergencyActionTarget(target).emergencyPause(rawPayload) {
-                success = true;
-            } catch {
-                success = false;
-            }
-
-            emit DownstreamPauseAttempt(target, success);
-        }
     }
 }

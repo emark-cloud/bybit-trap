@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {ITrap} from "./interfaces/ITrap.sol";
 import {BaselineFeeder} from "./BaselineFeeder.sol";
+import {TrapDeployConfig} from "./TrapDeployConfig.sol";
 
 interface IERC20Like {
     function balanceOf(address account) external view returns (uint256);
@@ -31,17 +32,18 @@ interface ISafeLike {
  *         gradual drain (window), and nonce velocity.
  *
  *         Operational model:
- *         - The monitored Safe, the BaselineFeeder, and the LST token addresses
- *           are provided via constructor (all immutable) so the same bytecode
- *           deploys against any Safe without source edits.
+ *         - Drosera deploys traps with no constructor args, so the monitored
+ *           Safe, the BaselineFeeder, and the LST token addresses live in
+ *           TrapDeployConfig (compile-time constants) and are surfaced via
+ *           `pure` accessor functions on this contract.
  *         - Expected/baseline values (masterCopy, threshold, owner count,
  *           ownersHash) live in a BaselineFeeder governed by a multisig; the
  *           trap reads them at `collect()` and embeds them in every snapshot,
  *           so `shouldRespond()` (pure) can compare without state access.
- *         - Every fallible read has an explicit `xxxReadOk` flag. Loss of
- *           visibility (Safe probe, masterCopy read, guard read, module read,
- *           token balance read) short-circuits to MonitoringDegraded instead
- *           of being silently conflated with a "clean" zero.
+ *         - Every fallible read has an explicit `xxxReadOk` flag, including
+ *           the BaselineFeeder read itself. Loss of visibility short-circuits
+ *           to MonitoringDegraded — but only when degradation persists across
+ *           two consecutive samples, so a one-block RPC blip cannot auto-pause.
  *         - `shouldRespond()` is wrapped in length-checked manual calldata
  *           parsing so malformed samples fail closed to `(false, "")` rather
  *           than reverting the operator's call.
@@ -65,6 +67,30 @@ contract BybitSafeTrapV2 is ITrap {
 
     address internal constant SAFE_SENTINEL = address(0x1);
 
+    // ======================== Deploy-time config (pure accessors) ========================
+
+    function SAFE_PROXY() public pure returns (address) {
+        return TrapDeployConfig.SAFE_PROXY;
+    }
+
+    function BASELINE_FEEDER() public pure returns (address) {
+        return TrapDeployConfig.BASELINE_FEEDER;
+    }
+
+    function STETH() public pure returns (address) {
+        return TrapDeployConfig.STETH;
+    }
+
+    function METH() public pure returns (address) {
+        return TrapDeployConfig.METH;
+    }
+
+    function CMETH() public pure returns (address) {
+        return TrapDeployConfig.CMETH;
+    }
+
+    constructor() {}
+
     // ======================== Types ========================
 
     enum ThreatType {
@@ -80,7 +106,7 @@ contract BybitSafeTrapV2 is ITrap {
         NonceJump
     }
 
-    /// @dev 25 value-typed fields, each encoding to a single 32-byte slot.
+    /// @dev 26 value-typed fields, each encoding to a single 32-byte slot.
     ///      Total abi.encode length = ENCODED_SNAPSHOT_LEN.
     struct Snapshot {
         // Binding + ordering
@@ -93,35 +119,36 @@ contract BybitSafeTrapV2 is ITrap {
         bool guardReadOk;               //  4
         bool modulesReadComplete;       //  5
         bool balancesReadOk;            //  6  (aggregate of LST balanceOf reads)
-        bool baselineConfigured;        //  7  (true if feeder has a baseline for this Safe)
+        bool baselineReadOk;            //  7  (BaselineFeeder.getBaseline succeeded)
+        bool baselineConfigured;        //  8  (true if feeder has a baseline for this Safe)
 
         // Safe core integrity
-        address masterCopy;             //  8
-        uint256 threshold;              //  9
-        uint256 ownerCount;             // 10
-        bytes32 ownersHash;             // 11
-        uint256 nonce;                  // 12
+        address masterCopy;             //  9
+        uint256 threshold;              // 10
+        uint256 ownerCount;             // 11
+        bytes32 ownersHash;             // 12
+        uint256 nonce;                  // 13
 
         // Modules & guard
-        uint256 moduleCount;            // 13
-        bytes32 modulesHash;            // 14
-        address guard;                  // 15
+        uint256 moduleCount;            // 14
+        bytes32 modulesHash;            // 15
+        address guard;                  // 16
 
         // Expected/baseline values (read from feeder at collect-time)
-        address expectedMasterCopy;     // 16
-        uint256 expectedThreshold;      // 17
-        uint256 expectedOwnerCount;     // 18
-        bytes32 expectedOwnersHash;     // 19
+        address expectedMasterCopy;     // 17
+        uint256 expectedThreshold;      // 18
+        uint256 expectedOwnerCount;     // 19
+        bytes32 expectedOwnersHash;     // 20
 
         // Balances
-        uint256 ethBalance;             // 20
-        uint256 stethBalance;           // 21
-        uint256 methBalance;            // 22
-        uint256 cmethBalance;           // 23
-        uint256 aggregateBalance;       // 24
+        uint256 ethBalance;             // 21
+        uint256 stethBalance;           // 22
+        uint256 methBalance;            // 23
+        uint256 cmethBalance;           // 24
+        uint256 aggregateBalance;       // 25
     }
 
-    uint256 internal constant SNAPSHOT_FIELDS = 25;
+    uint256 internal constant SNAPSHOT_FIELDS = 26;
     uint256 internal constant ENCODED_SNAPSHOT_LEN = SNAPSHOT_FIELDS * 32;
 
     struct IncidentPayload {
@@ -132,55 +159,27 @@ contract BybitSafeTrapV2 is ITrap {
         bytes details;
     }
 
-    // ======================== Immutables (deploy-time config) ========================
-
-    address public immutable SAFE_PROXY;
-    address public immutable BASELINE_FEEDER;
-
-    address public immutable STETH;
-    address public immutable METH;
-    address public immutable CMETH;
-
-    /// @param safeProxy_       The Safe{Wallet} multisig proxy being monitored.
-    /// @param baselineFeeder_  BaselineFeeder contract carrying governance-approved expected values.
-    /// @param steth_           stETH token address, or address(0) to disable that read.
-    /// @param meth_            mETH token address, or address(0) to disable that read.
-    /// @param cmeth_           cmETH token address, or address(0) to disable that read.
-    constructor(
-        address safeProxy_,
-        address baselineFeeder_,
-        address steth_,
-        address meth_,
-        address cmeth_
-    ) {
-        require(safeProxy_ != address(0), "zero safe");
-        require(baselineFeeder_ != address(0), "zero feeder");
-        SAFE_PROXY = safeProxy_;
-        BASELINE_FEEDER = baselineFeeder_;
-        STETH = steth_;
-        METH = meth_;
-        CMETH = cmeth_;
-    }
-
     // ======================== collect() ========================
 
     function collect() external view returns (bytes memory) {
+        address safe = SAFE_PROXY();
+
         (
             bool implementationValid,
             uint256 threshold,
             uint256 ownerCount,
             bytes32 ownersHash,
             uint256 safeNonce
-        ) = _probeSafeImplementation(SAFE_PROXY);
+        ) = _probeSafeImplementation(safe);
 
-        (bool masterCopyReadOk, address masterCopy) = _readMasterCopy(SAFE_PROXY);
-        (bool modulesReadComplete, uint256 moduleCount, bytes32 modulesHash) = _readModules(SAFE_PROXY);
-        (bool guardReadOk, address guard) = _readGuard(SAFE_PROXY);
+        (bool masterCopyReadOk, address masterCopy) = _readMasterCopy(safe);
+        (bool modulesReadComplete, uint256 moduleCount, bytes32 modulesHash) = _readModules(safe);
+        (bool guardReadOk, address guard) = _readGuard(safe);
 
-        uint256 ethBal = SAFE_PROXY.balance;
-        (bool stethOk, uint256 stethBal) = _safeBalanceOf(STETH, SAFE_PROXY);
-        (bool methOk, uint256 methBal) = _safeBalanceOf(METH, SAFE_PROXY);
-        (bool cmethOk, uint256 cmethBal) = _safeBalanceOf(CMETH, SAFE_PROXY);
+        uint256 ethBal = safe.balance;
+        (bool stethOk, uint256 stethBal) = _safeBalanceOf(STETH(), safe);
+        (bool methOk, uint256 methBal) = _safeBalanceOf(METH(), safe);
+        (bool cmethOk, uint256 cmethBal) = _safeBalanceOf(CMETH(), safe);
         bool balancesReadOk = stethOk && methOk && cmethOk;
 
         // Only sum balances we actually read successfully — otherwise a failed
@@ -190,17 +189,18 @@ contract BybitSafeTrapV2 is ITrap {
         if (methOk) aggregate += methBal;
         if (cmethOk) aggregate += cmethBal;
 
-        BaselineFeeder.Baseline memory baseline = _readBaseline(SAFE_PROXY);
+        (bool baselineReadOk, BaselineFeeder.Baseline memory baseline) = _readBaseline(safe);
 
         return abi.encode(
             Snapshot({
-                safeProxy: SAFE_PROXY,
+                safeProxy: safe,
                 blockNumber: block.number,
                 implementationValid: implementationValid,
                 masterCopyReadOk: masterCopyReadOk,
                 guardReadOk: guardReadOk,
                 modulesReadComplete: modulesReadComplete,
                 balancesReadOk: balancesReadOk,
+                baselineReadOk: baselineReadOk,
                 baselineConfigured: baseline.configured,
                 masterCopy: masterCopy,
                 threshold: threshold,
@@ -257,16 +257,14 @@ contract BybitSafeTrapV2 is ITrap {
         // EXPLOIT:   Attacker may disable or obscure Safe introspection (e.g. swap
         //            masterCopy to a contract whose getStorageAt/getModulesPaginated
         //            revert, or poison an LST read) to blind defenders before the
-        //            drain tx.
-        // DETECTION: Any fallible read sets its xxxReadOk flag to false, including
-        //            aggregate balancesReadOk across stETH/mETH/cmETH. Loss of
-        //            visibility is itself actionable — pause before damage.
-        if (
-            !current.masterCopyReadOk ||
-            !current.guardReadOk ||
-            !current.modulesReadComplete ||
-            !current.balancesReadOk
-        ) {
+        //            drain tx. The BaselineFeeder itself is also a degradation
+        //            vector — if it stops responding, the absolute checks lose
+        //            their reference values.
+        // DETECTION: Any fallible read sets its xxxReadOk flag to false. Loss of
+        //            visibility is itself actionable — but we require it to
+        //            persist across two consecutive samples to avoid pausing on
+        //            a single bad RPC poll.
+        if (_monitoringDegraded(current) && _monitoringDegraded(previous)) {
             return _incident(
                 ThreatType.MonitoringDegraded,
                 current,
@@ -275,7 +273,13 @@ contract BybitSafeTrapV2 is ITrap {
                     current.masterCopyReadOk,
                     current.guardReadOk,
                     current.modulesReadComplete,
-                    current.balancesReadOk
+                    current.balancesReadOk,
+                    current.baselineReadOk,
+                    previous.masterCopyReadOk,
+                    previous.guardReadOk,
+                    previous.modulesReadComplete,
+                    previous.balancesReadOk,
+                    previous.baselineReadOk
                 )
             );
         }
@@ -468,6 +472,20 @@ contract BybitSafeTrapV2 is ITrap {
 
     // ======================== Internal ========================
 
+    /// @dev Aggregated read-health predicate. Any false `xxxReadOk` flag means
+    ///      we have a partial view of the Safe and downstream checks would be
+    ///      operating on stale or zero values. The caller requires this to be
+    ///      true on TWO consecutive samples before tripping MonitoringDegraded.
+    function _monitoringDegraded(Snapshot memory s) internal pure returns (bool) {
+        return (
+            !s.masterCopyReadOk ||
+            !s.guardReadOk ||
+            !s.modulesReadComplete ||
+            !s.balancesReadOk ||
+            !s.baselineReadOk
+        );
+    }
+
     function _incident(
         ThreatType threatType,
         Snapshot memory current,
@@ -502,24 +520,25 @@ contract BybitSafeTrapV2 is ITrap {
         s.guardReadOk            = _boolAt(raw,  4);
         s.modulesReadComplete    = _boolAt(raw,  5);
         s.balancesReadOk         = _boolAt(raw,  6);
-        s.baselineConfigured     = _boolAt(raw,  7);
-        s.masterCopy             = _addrAt(raw,  8);
-        s.threshold              = _uintAt(raw,  9);
-        s.ownerCount             = _uintAt(raw, 10);
-        s.ownersHash             = _bytes32At(raw, 11);
-        s.nonce                  = _uintAt(raw, 12);
-        s.moduleCount            = _uintAt(raw, 13);
-        s.modulesHash            = _bytes32At(raw, 14);
-        s.guard                  = _addrAt(raw, 15);
-        s.expectedMasterCopy     = _addrAt(raw, 16);
-        s.expectedThreshold      = _uintAt(raw, 17);
-        s.expectedOwnerCount     = _uintAt(raw, 18);
-        s.expectedOwnersHash     = _bytes32At(raw, 19);
-        s.ethBalance             = _uintAt(raw, 20);
-        s.stethBalance           = _uintAt(raw, 21);
-        s.methBalance            = _uintAt(raw, 22);
-        s.cmethBalance           = _uintAt(raw, 23);
-        s.aggregateBalance       = _uintAt(raw, 24);
+        s.baselineReadOk         = _boolAt(raw,  7);
+        s.baselineConfigured     = _boolAt(raw,  8);
+        s.masterCopy             = _addrAt(raw,  9);
+        s.threshold              = _uintAt(raw, 10);
+        s.ownerCount             = _uintAt(raw, 11);
+        s.ownersHash             = _bytes32At(raw, 12);
+        s.nonce                  = _uintAt(raw, 13);
+        s.moduleCount            = _uintAt(raw, 14);
+        s.modulesHash            = _bytes32At(raw, 15);
+        s.guard                  = _addrAt(raw, 16);
+        s.expectedMasterCopy     = _addrAt(raw, 17);
+        s.expectedThreshold      = _uintAt(raw, 18);
+        s.expectedOwnerCount     = _uintAt(raw, 19);
+        s.expectedOwnersHash     = _bytes32At(raw, 20);
+        s.ethBalance             = _uintAt(raw, 21);
+        s.stethBalance           = _uintAt(raw, 22);
+        s.methBalance            = _uintAt(raw, 23);
+        s.cmethBalance           = _uintAt(raw, 24);
+        s.aggregateBalance       = _uintAt(raw, 25);
     }
 
     function _wordAt(bytes calldata raw, uint256 i) private pure returns (bytes32 w) {
@@ -657,11 +676,15 @@ contract BybitSafeTrapV2 is ITrap {
         }
     }
 
-    function _readBaseline(address safe) internal view returns (BaselineFeeder.Baseline memory b) {
-        try BaselineFeeder(BASELINE_FEEDER).getBaseline(safe) returns (BaselineFeeder.Baseline memory out) {
-            return out;
+    /// @dev `ok` distinguishes the feeder being unreachable (revert / no code)
+    ///      from the feeder returning an unconfigured baseline. The former is
+    ///      a monitoring degradation; the latter is a deliberate operator
+    ///      choice and merely disables absolute checks.
+    function _readBaseline(address safe) internal view returns (bool ok, BaselineFeeder.Baseline memory b) {
+        try BaselineFeeder(BASELINE_FEEDER()).getBaseline(safe) returns (BaselineFeeder.Baseline memory out) {
+            return (true, out);
         } catch {
-            return b;
+            return (false, b);
         }
     }
 }

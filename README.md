@@ -75,20 +75,20 @@ registry → target.emergencyPause(payload)       (try/catch per target)
 
 Rotating the baseline therefore happens on-chain — `feeder.setBaseline(...)` behind the governance multisig/timelock — with no trap redeploy. If the feeder read fails or the Safe is not yet configured, `baselineConfigured = false` and absolute checks (MasterCopyChanged / ConfigChanged-absolute) are skipped; relative checks and all non-baseline triggers still fire.
 
-### Snapshot (25 fields, 800 bytes encoded)
+### Snapshot (26 fields, 832 bytes encoded)
 
 `collect()` emits a snapshot bound to both a block and a Safe. Every fallible read returns a status flag so `shouldRespond()` can tell "loss of visibility" from "legitimately zero":
 
 | Group | Fields |
 |---|---|
 | Binding | `safeProxy`, `blockNumber` |
-| Read status | `implementationValid`, `masterCopyReadOk`, `guardReadOk`, `modulesReadComplete`, `balancesReadOk`, `baselineConfigured` |
+| Read status | `implementationValid`, `masterCopyReadOk`, `guardReadOk`, `modulesReadComplete`, `balancesReadOk`, `baselineReadOk`, `baselineConfigured` |
 | Safe core | `masterCopy`, `threshold`, `ownerCount`, `ownersHash`, `nonce` |
 | Modules & guard | `moduleCount`, `modulesHash`, `guard` |
 | Expected baseline | `expectedMasterCopy`, `expectedThreshold`, `expectedOwnerCount`, `expectedOwnersHash` |
 | Balances | `ethBalance`, `stethBalance`, `methBalance`, `cmethBalance`, `aggregateBalance` |
 
-`aggregateBalance` only sums tokens whose reads succeeded; a failed token read sets `balancesReadOk = false` rather than silently contributing zero.
+`aggregateBalance` only sums tokens whose reads succeeded; a failed token read sets `balancesReadOk = false` rather than silently contributing zero. `baselineReadOk` distinguishes "feeder unreachable" (degradation) from `baselineConfigured = false` (deliberate operator choice — absolute checks are simply skipped).
 
 ### Structured Incident Payload
 
@@ -112,7 +112,7 @@ Matching signature: `handleIncident(bytes)`.
 
 | # | ThreatType | Severity | What fires it |
 |---|---|---|---|
-| 1 | `MonitoringDegraded` | CRITICAL | Any of the paginated-complete / masterCopy-read / guard-read / balances-read flags is false. Loss of visibility — on Safe state **or** token balances — is itself treated as actionable, so a failed token read cannot masquerade as `BalanceDrain`. |
+| 1 | `MonitoringDegraded` | CRITICAL | Any of the paginated-complete / masterCopy-read / guard-read / balances-read / baseline-read flags is false **on two consecutive samples**. Loss of visibility — on Safe state, token balances, **or** the BaselineFeeder itself — is treated as actionable, so a failed read cannot masquerade as `BalanceDrain`. The two-sample debounce prevents a one-block RPC blip from auto-pausing. |
 | 2 | `ImplementationCompromised` | CRITICAL | `getThreshold()` / `getOwners()` / `nonce()` reverted or returned absurd values. This is the **primary Bybit signal** — the malicious implementation did not implement the Safe ABI. |
 | 3 | `MasterCopyChanged` | CRITICAL | Slot-0 read != feeder's `expectedMasterCopy`. Catches the class of attacks where the swapped-in implementation still serves Safe ABI but adds backdoor logic. *(Absolute check — gated on `baselineConfigured`.)* |
 | 4 | `ConfigChanged` | CRITICAL | `threshold` / `ownerCount` / `ownersHash` != feeder's expected baseline. *(Absolute check — gated on `baselineConfigured`.)* |
@@ -130,7 +130,7 @@ Absolute checks (vs known-good baseline) **and** relative checks (vs previous sn
 `SafeGuardResponderV2` consumes a single abi-encoded `IncidentPayload`. It is:
 
 - **Allowlisted** — a configurable `relayer` plus a mapping of additional `allowedCallers`, since the real Drosera executor may vary by network.
-- **Idempotent** — the payload's `keccak256` is the incident ID; retries are no-ops.
+- **Idempotent on success only** — an incident hash is marked executed *after* at least one approved target accepts the pause; a successful replay is a no-op, but if every approved target reverts the call also reverts and the hash stays clear so the operator can retry once a downstream hook is healthy again.
 - **Globally pausable** — admin can kill-switch the responder during a false-positive storm.
 - **Bounded fan-out** — reads `SafeGuardianRegistry.getTargets()` and calls `emergencyPause(payload)` on each approved target via `try/catch`, so one misbehaving target cannot block the others. The registry caps total targets at `MAX_TARGETS = 16`, bounding fan-out gas.
 
@@ -148,17 +148,18 @@ forge build
 forge test --match-path 'test/BybitSafeTrapV2.t.sol' -vv
 ```
 
-Fork tests require an Ethereum archive RPC; the default is `https://eth.drpc.org` via `foundry.toml`.
+Fork tests require an Ethereum archive RPC; the default is `https://ethereum-rpc.publicnode.com` via `foundry.toml`. (drpc free tier 408s on `eth_getStorageAt` for the synthetic `TrapDeployConfig.BASELINE_FEEDER` address that the trap reads — publicnode serves these instantly and retains archive state at the Bybit block.)
 
-### Test Inventory (56/56 passing)
+### Test Inventory (60/60 V2 tests passing — 90/90 total including legacy V1 suite)
 
-**Trap — synthetic windows (29 tests)**
+**Trap — synthetic windows (31 tests)**
 
 | Bucket | Tests |
 |---|---|
 | Normal | `test_NoTrigger_HealthyWindow` |
 | Input guards | `test_NoTrigger_EmptyData`, `test_NoTrigger_SingleSample`, `test_NoTrigger_OversizedWindow`, `test_NoTrigger_NonContiguousBlocks`, `test_NoTrigger_ReorderedBlocks`, `test_NoTrigger_ZeroSafeProxy`, `test_NoTrigger_MismatchedSafeProxy`, `test_NoTrigger_MalformedBytes_WrongLength`, `test_NoTrigger_MalformedBytes_EmptyPrevious` |
-| Triggers | one per ThreatType: `MonitoringDegraded` (master-copy read, balances read), `ImplementationCompromised`, `MasterCopyChanged`, `GuardChanged`, `ModulesChanged`, `BalanceDrain`, `GradualDrain`, `NonceJump` |
+| MonitoringDegraded (2-sample debounce) | `test_Trigger_MonitoringDegraded_MasterCopyReadFailedPersistent`, `test_Trigger_MonitoringDegraded_BalancesReadFailedPersistent`, `test_Trigger_MonitoringDegraded_BaselineReadFailedPersistent`, `test_NoTrigger_SingleSampleMonitoringDegraded` |
+| Other Triggers | one per ThreatType: `ImplementationCompromised`, `MasterCopyChanged`, `GuardChanged`, `ModulesChanged`, `BalanceDrain`, `GradualDrain`, `NonceJump` |
 | Absolute baseline | `test_Trigger_ConfigChanged_AbsoluteThreshold`, `test_Trigger_ConfigChanged_AbsoluteOwnerCount`, `test_NoTrigger_BaselineUnconfigured_NoFalseAbsolute` |
 | Relative | `test_Trigger_ConfigChanged_RelativeOwnersHash`, `test_NoTrigger_ModulesChanged_PreviousIncompleteRead` |
 | Balance-read status | `test_NoTrigger_BalanceDrain_PreviousBalancesDegraded` |
@@ -181,24 +182,27 @@ Fork tests require an Ethereum archive RPC; the default is `https://eth.drpc.org
 | Validation | `test_Set_RejectsInvalid` |
 | Read path | `test_Set_AndRead`, `test_UnsetBaseline_ReturnsUnconfigured`, `test_ClearBaseline` |
 
-**Responder + Registry + Fan-out (18 tests)**
+**Responder + Registry + Fan-out (20 tests)**
 
 | Area | Tests |
 |---|---|
 | Auth | `test_Auth_Relayer_CanHandle`, `test_Auth_AllowedCaller_CanHandle`, `test_Auth_Unauthorized_Reverts`, `test_Auth_OnlyAdminCanSetAllowed` |
 | Idempotency | `test_Idempotent_DoubleCallDoesNotDoubleExecute`, `test_Idempotent_DifferentPayloadsProduceSeparateIncidents` |
+| Retry-after-failure | `test_Response_AllTargetsFail_DoesNotMarkExecuted`, `test_Response_RetrySucceedsAfterInitialFailure` |
 | Validation | `test_Reject_InvalidThreatType`, `test_Reject_ZeroSafeProxy`, `test_Reject_BadBlockOrdering` |
 | Global pause | `test_GlobalPause_BlocksHandle` |
 | Fan-out | `test_FanOut_CallsAllApprovedTargets`, `test_FanOut_RevokedTargetIsSkipped`, `test_FanOut_RevertingTargetDoesNotBlockOthers`, `test_FanOut_NoDuplicateCallAfterRevokeReapprove` |
 | Registry | `test_Registry_OnlyOwnerCanSetTarget`, `test_Registry_DuplicateApprovalDoesNotDuplicateEntry`, `test_Registry_RevokeAndReapproveDoesNotDuplicate`, `test_Registry_MaxTargetsBound` |
 
-### Fork-test caveat
+### Fork-test setup
 
-Foundry forks return empty bytes from Safe's `getStorageAt` — a known environmental limitation, not a trap defect. The trap correctly flags this as `MonitoringDegraded`. The fork tests normalize the read flags before exercising the `ImplementationCompromised` path so the assertion chain proves the real Bybit signal. Real operator RPCs are not affected.
+The trap is constructorless and reads the feeder from a fixed address (`TrapDeployConfig.BASELINE_FEEDER`). Fork tests overlay the `BaselineFeeder` bytecode at that address with `vm.etch` and seed baseline storage with `vm.store`, so `collect()` runs end-to-end against the real Bybit-era Safe state. The fork tests further normalize `masterCopyReadOk` / `guardReadOk` / `modulesReadComplete` / `baselineReadOk` before exercising the `ImplementationCompromised` path, because Foundry-forked `getStorageAt` returns empty bytes — a known environmental limitation that the trap correctly flags as `MonitoringDegraded`. Real operator RPCs are not affected.
 
 ## Deployment
 
 Deployment is a four-contract sequence. Every `initialOwner` / `admin` / `relayer` below **must** be a governance multisig + timelock in production — an EOA makes the contracts governance-*compatible*, not governance-*managed*.
+
+Drosera deploys traps with **no constructor arguments**, so the trap's monitored addresses (Safe proxy, BaselineFeeder, the three LST tokens) live in `src/TrapDeployConfig.sol` as `internal constant`s and are surfaced via `pure` accessors (`SAFE_PROXY()`, `BASELINE_FEEDER()`, etc.). Step 3 below is *edit the source*, not pass flags.
 
 ```bash
 # 1. BaselineFeeder — governance sets the per-Safe expected config
@@ -209,14 +213,12 @@ forge create src/BaselineFeeder.sol:BaselineFeeder \
 forge create src/SafeGuardianRegistry.sol:SafeGuardianRegistry \
   --constructor-args <GOVERNANCE_MULTISIG>
 
-# 3. BybitSafeTrapV2 — immutables: Safe proxy, feeder, and the three LST addresses
-forge create src/BybitSafeTrapV2.sol:BybitSafeTrapV2 \
-  --constructor-args \
-    0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4 \
-    <BASELINE_FEEDER> \
-    0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84 \
-    0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa \
-    0xe3C063B1BEe9de02eb28352b55D49D85514C67FF
+# 3. BybitSafeTrapV2 — edit TrapDeployConfig.sol with the deployed feeder address,
+#    rebuild, then deploy. No constructor args.
+#    Required edit:  BASELINE_FEEDER = <BASELINE_FEEDER from step 1>
+#    (SAFE_PROXY, STETH, METH, CMETH ship pre-populated with Bybit-era addresses.)
+forge build
+forge create src/BybitSafeTrapV2.sol:BybitSafeTrapV2
 
 # 4. SafeGuardResponderV2 — (admin, relayer, registry)
 forge create src/SafeGuardResponderV2.sol:SafeGuardResponderV2 \
@@ -256,7 +258,7 @@ private_trap = true
 whitelist = ["0x...", "0x..."]
 ```
 
-`foundry.toml` requires `via_ir = true` — the 25-field Snapshot exceeds the stack limit without it.
+`foundry.toml` requires `via_ir = true` — the 26-field Snapshot exceeds the stack limit without it.
 
 ## Assumptions
 
