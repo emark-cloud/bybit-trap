@@ -80,7 +80,7 @@ Toward Flytrap's 100–200 deployment target, horizontal traps like this are the
 
 ## 6. Sweat-the-details signal only lands if it's visible
 
-This folder contains six contracts, 90 tests, two rounds of absorbed external review, malformed-bytes hardening via manual `calldataload` decoding, idempotent fan-out, and explicit read-status flags for every fallible read. None of that is visible to anyone who hasn't read the README.
+This folder contains six contracts, 90 tests, malformed-bytes hardening via manual `calldataload` decoding, idempotent fan-out, and explicit read-status flags for every fallible read. None of that is visible to anyone who hasn't read the README.
 
 Engineering pedigree is the antidote to the "AI slop quantity-grinding" perception Drosera's community is trying to shed. But the antidote only works if the design choices are surfaced where non-engineers can see them.
 
