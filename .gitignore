@@ -1,0 +1,8 @@
+cache/
+out/
+node_modules/
+bun.lock
+bun.lockb
+.env
+.DS_Store
+LESSONS.md
